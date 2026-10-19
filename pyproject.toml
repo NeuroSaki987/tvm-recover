@@ -1,0 +1,23 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "tvm-recover"
+version = "0.1.0"
+description = "Semantic devirtualizer for Tencent ACE's .tvm0 section, with an IR -> LLVM IR backend"
+readme = "README.md"
+requires-python = ">=3.13"
+license = { text = "MIT" }
+dependencies = ["capstone>=5.0,<6.0"]
+
+[project.optional-dependencies]
+solver = ["z3-solver>=4.13"]
+llvm = ["llvmlite==0.50.0"]
+
+# This is a tool collection, not an installed library: the modules are imported
+# relative to `engine/` and `llvm/`, both of which put themselves on sys.path.
+# The packaging metadata exists so a repository consumer gets a stable
+# requires-python / dependency declaration, not so that `pip install .` works.
+[tool.setuptools]
+packages = []

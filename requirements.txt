@@ -1,0 +1,10 @@
+# Runtime requirements.
+#   engine/    needs capstone (disassembly). z3-solver is OPTIONAL: without it the
+#              engine keeps path conditioning and falls back to the legacy
+#              dispatcher resolver (see docs/TOOLS-ENGINE.md §5).
+#   llvm/      needs llvmlite (bundles LLVM) and, on Windows, MSVC link.exe on PATH.
+capstone>=5.0,<6.0
+
+# Optional, both sides:
+# z3-solver>=4.13
+# llvmlite==0.50.0
