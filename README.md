@@ -19,7 +19,7 @@ It is a tool: point it at a module, get structure and code back out.
 
 Devirtualized listing of a VM root, with the guest register file bound across blocks.
 
-![Devirtualized listing](img/devirt_listing.png)
+![Devirtualization result](img/devirt_listing.png)
 
 ## Build
 

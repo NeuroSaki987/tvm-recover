@@ -16,7 +16,7 @@
 
 某个 VM root 的还原后 listing，guest 寄存器组在跨块绑定后的形式。
 
-![Devirtualized listing](img/devirt_listing.png)
+![虚拟化还原效果图](img/devirt_listing.png)
 
 ## 构建
 
