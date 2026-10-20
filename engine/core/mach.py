@@ -236,6 +236,10 @@ class Machine:
         # result, which is the one situation where the stored bytes cannot be
         # trusted to be the bytes the VM would see.
         self.symbolic_window: tuple[int, int] | None = None
+        # Set by `Lifter.__init__` when the `not`/`xchg` deobfuscation is on. The
+        # machine only reports writes to it; the decision to undo a swap lives in
+        # `mba.SwapTracker`, so this file stays free of protector-specific policy.
+        self.swap_tracker = None
 
     # ------------------------------------------------------------- registers
 
@@ -260,10 +264,16 @@ class Machine:
         high-byte write (`ah`) replaces bits 8..15. Getting this wrong silently
         corrupts the obfuscator's inverted-register dance, which mixes byte and
         word accesses to the same register on purpose.
+
+        Every write is reported to `swap_tracker` when one is installed, because an
+        `xchg` pair can only be undone while neither of its registers has been
+        written in between. See `core/mba.SwapTracker`.
         """
         parent, w, off = canon(name)
         if parent == "rip":
             raise KeyError("cannot write rip through the register file")
+        if self.swap_tracker is not None:
+            self.swap_tracker.on_write(name)
         if parent not in self.regs:
             self.regs[parent] = self.a.opaque(f"ctrl_{parent}", W64)
         if width is None:

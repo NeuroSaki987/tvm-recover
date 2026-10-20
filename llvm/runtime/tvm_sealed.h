@@ -33,8 +33,14 @@ typedef long long i64;
 #endif
 
 /* Results are kept for at most this many functions; the builder refuses a corpus that exceeds it
- * rather than truncating the report. */
-#define TVM_NFUNC_MAX 256
+ * rather than truncating the report.
+ *
+ * **Must equal `llvm/payload.py::NFUNC_MAX`.** The pairing is a layout contract, not a convention:
+ * `payload.py` derives `STATE_BYTES` from its copy and hands it to the generated C, this header sizes
+ * `result[]`, and `tvm_state_layout_ok()` checks the consequence at run time. It was 256, which the
+ * DeltaForce base image outgrew (351 well-formed roots, 265 of them composable); 512 costs 2 048 more
+ * bytes of state and all of it is in `result[]`. */
+#define TVM_NFUNC_MAX 512
 
 /* Little-endian spellings of the ASCII tags: 'NEKO' and 'NKP1' read back as these values. */
 #define TVM_STATE_MAGIC 0x4F4B454EULL

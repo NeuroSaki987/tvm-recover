@@ -35,6 +35,7 @@ from .canon import MUTATIONS, identify, influence_set
 from .expr import W64, Arena, boolean_subexpressions, render
 from .guestctx import (ARCH, FLAGS, GUEST_CTX_FROM_ENTRY_RBP, HANDLER_TIME,
                        GuestCache, GuestContext, from_working_frame)
+from . import ctxlayout
 from .ir import call_target
 from .lift64 import Lifter, Stop
 from .mach import Machine
@@ -310,6 +311,18 @@ class Recoverer:
         self.vip_slot: int | None = None
         self.unwind_slot: int | None = None
         self.vip_samples = 0
+        # **Where the guest register file is, measured from the handlers.** `None`
+        # means discovery found no `lea base,[rbp+D]` + `[base+off]` idiom and the
+        # legacy `rbp`-relative window is in use; the source string says which.
+        self.layout: ctxlayout.Layout | None = None
+        self.layout_source = "not derived"
+        # Offset from the sampled frame to the image, actually used for this run.
+        # Every read of the context goes through `ctx_base`, so there is exactly one
+        # place where the number is chosen.
+        self.ctx_off_from_rbp: int | None = None
+        # The absolute context window found during `prepare`, if one was found.
+        self.ctx_located = None
+        self.ctx_locate_samples = 0
         # The guest register image, once a frame has been sampled. Set in
         # `_prepare`; `None` means the walk reports addresses, not register names.
         self.guest_ctx: GuestContext | None = None
@@ -376,34 +389,156 @@ class Recoverer:
         arena = Arena()
         return arena, Machine(arena, self.stack_base)
 
-    def prepare(self, root: int) -> tuple[Arena, Machine, Lifter]:
-        """Locate the frame invariants on a throwaway run, then start clean."""
+    def _validate_base(self, base: int, pa, pm):
+        """Does `base` still look like the guest register file? Cheap: 17 words."""
+        vm_slots = 0
+        rsp_ok = False
+        for s in range(0, ctxlayout.FLAGS_OFF, 8):
+            c = pa.as_const(pm.load(pa.const(base + s, 64), 8, 0, self.img.image_u8))
+            if c is None:
+                continue
+            if s == ctxlayout.RSP_OFF:
+                rsp_ok = c == self.stack_base
+            elif self.vm_lo <= c < self.vm_hi:
+                vm_slots += 1
+        return (rsp_ok or vm_slots >= 1), vm_slots, rsp_ok
+
+    def _locate_ctx(self, pa, pm, rbp: int):
+        """The guest register file inside the frame based at `rbp`, or `None`.
+
+        Cheap in the common case: the offset found last time is re-validated by its own
+        signature words (the `rsp` slot holding the machine stack base, any other slot
+        holding a `.tvm0` pointer) and only re-derived when it stops explaining them. A
+        frame that moved -- and on this build it does, by `0xb0` between entry and the
+        end of one walk -- therefore re-derives instead of silently reading the wrong
+        words, which is exactly what a compiled-in constant cannot do.
+        """
+        # An absolute base found earlier wins over any offset arithmetic: the frame
+        # moves, the stack slot the file lives in does not.
+        lc = self.ctx_located
+        if lc is not None:
+            ok, vm_slots, rsp_ok = self._validate_base(lc.base, pa, pm)
+            if ok:
+                return ctxlayout.Located(lc.base, lc.base - rbp, vm_slots, rsp_ok, None)
+        cached = self.ctx_off_from_rbp
+        if cached is not None:
+            base = rbp + cached
+            vm_slots = 0
+            rsp_ok = False
+            for s in range(0, ctxlayout.FLAGS_OFF, 8):
+                c = pa.as_const(pm.load(pa.const(base + s, 64), 8, 0, self.img.image_u8))
+                if c is None:
+                    continue
+                if s == ctxlayout.RSP_OFF:
+                    rsp_ok = c == self.stack_base
+                elif self.vm_lo <= c < self.vm_hi:
+                    vm_slots += 1
+            if rsp_ok or vm_slots >= ctxlayout.MIN_VM_SLOTS:
+                return ctxlayout.Located(base, cached, vm_slots, rsp_ok, None)
+        loc = ctxlayout.locate_in_frame(
+            pa, pm, rbp, self.img, self.vm_lo, self.vm_hi, self.stack_base)
+        if ctxlayout.fits(loc):
+            self.ctx_off_from_rbp = loc.off_from_rbp
+            self.ctx_located = loc
+            self.layout_source = (
+                f"located in frame: rbp{loc.off_from_rbp:+#x} "
+                f"(vm_slots={loc.vm_slots}, rsp_signature={loc.rsp_ok})")
+            return loc
+        return None
+
+    def _sample_context_slots(self, root: int):
+        """Walk once, locating the context dynamically, and tally per-slot values.
+
+        Returns `(sample, rbp)`. `sample` maps a **slot offset inside the image** to the
+        set of in-`.tvm0` values it held, so the tally is frame-independent and survives
+        the `rbp` drift that made a fixed offset wrong in the first place.
+        """
         pa, pm = self._initial_state(root)
         probe = self._lifter(pa, pm)
         sample: dict[int, set[int]] = {}
         ip = root
+        rbp = None
+        votes = []
+        base = None
+        located = 0
         for i in range(20_000):
             if i % 16 == 0:
                 rbp = pa.as_const(pm.reg("rbp", 64))
                 if rbp is not None:
-                    for off in range(0, CONTEXT_WINDOW, 8):
-                        v = pm.load(pa.const(rbp + off, 64), 8, 0, self.img.image_u8)
-                        c = pa.as_const(v)
-                        if c is not None and self.vm_lo <= c < self.vm_hi:
-                            sample.setdefault(off, set()).add(c)
+                    # Phase 1: each sample votes for the offset whose window holds both
+                    # signatures -- a `.tvm0` pointer and the machine stack base. The
+                    # winner has to win repeatedly; see `core/ctxlayout`.
+                    if base is None:
+                        window = {}
+                        for off in range(-0x200, ctxlayout.FRAME_SCAN, 8):
+                            c = pa.as_const(pm.load(pa.const(rbp + off, 64), 8, 0,
+                                                    self.img.image_u8))
+                            if c is not None:
+                                window[off] = c
+                        votes.append(ctxlayout.vote(window, self.vm_lo, self.vm_hi,
+                                                    self.stack_base))
+                        if len(votes) >= ctxlayout.VOTE_MIN:
+                            off, count = ctxlayout.locate_by_vote(
+                                votes, self.vm_lo, self.vm_hi)
+                            if off is not None:
+                                base = rbp + off
+                                located = count
+                                self.ctx_off_from_rbp = off
+                                self.ctx_located = ctxlayout.Located(
+                                    base, off, 0, True, None)
+                                self.layout_source = (
+                                    f"signature candidate (assumed architectural rsp): rbp{off:+#x} -> {base:#x} "
+                                    f"({count} samples agreed; window holds a .tvm0 "
+                                    f"pointer and the stack base at the assumed rsp slot)")
+                    # Phase 2: with a base known, tally the slots it holds.
+                    if base is not None:
+                        for off in range(0, CONTEXT_WINDOW, 8):
+                            c = pa.as_const(pm.load(pa.const(base + off, 64), 8, 0,
+                                                    self.img.image_u8))
+                            if c is not None and self.vm_lo <= c < self.vm_hi:
+                                sample.setdefault(off, set()).add(c)
             kind, payload = probe.step(ip)
             if kind != "next":
                 break
             ip = payload
+        self.ctx_locate_samples = located
+        # The sampling machine is handed back rather than rebuilt: a caller that
+        # supplies an entry context counts every replay, and a third one here was a
+        # real regression (`tests/test_context_integration.py`).
+        return sample, rbp, pa, pm
+
+    def prepare(self, root: int) -> tuple[Arena, Machine, Lifter]:
+        """Locate the frame invariants on a throwaway run, then start clean."""
+        # **Ask the handlers where the image is before reading anything.**
+        # The old code scanned `rbp + 0..0x90` and called that the context window;
+        # that is a different window from the one `guestctx.from_working_frame`
+        # built (`rbp + 0x138`), so the vip detection and the census disagreed
+        # about what a slot was. `ctxlayout` measures the displacement from the
+        # `lea base,[rbp+D]` the handlers actually emit, so both now read the same
+        # words. When discovery finds nothing, the legacy window is used unchanged
+        # and `layout_source` says so rather than pretending a measurement happened.
+        if self.layout is None:
+            self.layout = ctxlayout.for_image(self.img)
+            if self.layout is not None:
+                self.layout_source = (
+                    f"discovered: lea base,[rbp+{self.layout.handler_disp:#x}] "
+                    f"then [base+off] over {len(self.layout.slots)} slots "
+                    f"({self.layout.order_evidence})")
+            else:
+                self.layout_source = "fallback: legacy rbp-relative window (no lea/[base+off] idiom)"
+        sample, rbp, pa, pm = self._sample_context_slots(root)
         # The vip is the slot whose in-`.tvm0` value moves most, because
-        # executing a VM instruction is what advances it.
+        # executing a VM instruction is what advances it. Because the tally is keyed by
+        # slot offset *inside the image*, it is the same tally whichever frame each
+        # sample happened in.
         if sample:
             self.vip_slot = max(sample.items(), key=lambda kv: (len(kv[1]), -kv[0]))[0]
             self.vip_samples = len(sample)
+        else:
+            self.layout_source = "fallback: no guest register file located in any frame"
         # The unwind slot is a `.tvm0` pointer the VM parks at [rbp+0] for the
         # unwinder; it never moves, so it is not the vip and must stay out of
         # the block identity.
-        rbp = pa.as_const(pm.reg("rbp", 64))
         if rbp is not None:
             u = pa.as_const(pm.load(pa.const(rbp, 64), 8, 0, self.img.image_u8))
             if u is not None and self.vm_lo <= u < self.vm_hi:
@@ -430,8 +565,17 @@ class Recoverer:
         #
         # The census itself is opt-in because it costs about five percent of a
         # run; `guest_census=True` is for callers that read it.
-        if rbp is not None:
+        if self.ctx_located is not None:
+            # The base this run actually found, not a compiled-in offset. The address
+            # is absolute, so it is immune to the `rbp` drift between the sampling walk
+            # and this point -- which is the whole reason a constant kept being wrong.
+            self.guest_ctx = GuestContext(self.ctx_located.base)
+            self.guest_ctx_source = self.layout_source
+        elif rbp is not None:
+            # Nothing located a register file; fall back to the legacy window so a
+            # caller still gets address-level output instead of an exception.
             self.guest_ctx = from_working_frame(rbp)
+            self.guest_ctx_source = "fallback: legacy rbp+0x138 window"
         elif self.handler_cache is not None and getattr(self.handler_cache, "ctx", None):
             # **A symbolic first-block `rbp` is not the same as no frame at all, and treating
             # them as the same produced an empty listing.** `derive_guest_cache` samples `rbp`
@@ -466,9 +610,20 @@ class Recoverer:
         rbp = a.as_const(L.m.reg("rbp", 64))
         if rbp is None:
             return 0
+        # **Hash the guest register file, not whatever happens to sit at `rbp`.**
+        # The window base is the displacement this run measured (`ctxlayout`), so the
+        # slots are the seventeen words the handlers actually read and write: sixteen
+        # guest registers plus the flags. The only in-`.tvm0` pointers in that window
+        # are the vip, which is what makes it a usable program-point identity -- and
+        # the guest values around it are excluded deliberately, so a block is not
+        # re-recovered once per guest value (see the docstring above).
+        loc = self._locate_ctx(a, L.m, rbp)
+        if loc is None:
+            return 0
+        base = loc.base
         h = 0xCBF29CE484222325
         for off in range(0, CONTEXT_WINDOW, 8):
-            v = L.m.load(a.const(rbp + off, 64), 8, 0, L.img.image_u8)
+            v = L.m.load(a.const(base + off, 64), 8, 0, L.img.image_u8)
             c = a.as_const(v)
             if off == self.vip_slot:
                 # The vip is part of the identity whether or not it is known.

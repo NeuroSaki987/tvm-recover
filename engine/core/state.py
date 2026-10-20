@@ -115,6 +115,10 @@ class MachineSnapshot:
                 self.census.maps[name] = {k: v for k, v in remapped.items() if k not in ambiguous}
 
     def restore(self, machine, lifter=None):
+        # Cancellation evidence belongs to the execution path that produced it.
+        # Register refs restored from a snapshot must not reuse discarded swaps.
+        if machine.swap_tracker is not None:
+            machine.swap_tracker.flush()
         for name in self.DICTS:
             _restore_dict(getattr(machine, name), getattr(self, name))
         for name in self.LISTS:
