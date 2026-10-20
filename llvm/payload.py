@@ -151,7 +151,11 @@ MAX_WHOLE_STATEMENTS = 7000
 #: It was 64, which is what a 14-function user-mode module needs; a kernel driver has **144** virtualized
 #: roots (`ACE-CORE.sys3`), and the build refused the corpus at 68 functions rather than truncating.
 #: 256 costs 1 536 bytes of state and keeps every root of every driver in this distribution.
-NFUNC_MAX = 256
+#: **512 is the DeltaForce base image's requirement:** 351 well-formed VM roots, of which 265 compose,
+#: so 256 rejected the corpus with `265 functions exceeds TVM_NFUNC_MAX`. The cost is linear in this
+#: constant only -- `result[]` -- so 512 adds 2 048 bytes to a state block already dominated by the
+#: 8 192-slot byte map, and `STATE_BYTES` is derived from it rather than written out.
+NFUNC_MAX = 512
 
 #: The state layout, mirrored from `runtime/tvm_sealed.h`. `tvm_sealed.c` static-asserts every one of
 #: these with `offsetof`, so a compiler that pads differently fails the build rather than letting the

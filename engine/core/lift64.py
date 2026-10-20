@@ -150,6 +150,14 @@ class Lifter:
                  box_unmodelled: bool = True):
         self.img = img
         self.m = machine
+        # The `not`/`xchg` deobfuscation, installed on the machine so `set_reg` can
+        # report writes without `mach.py` needing to know what they are for.
+        try:
+            from .mba import SwapTracker
+            self.swaps = SwapTracker(machine)
+            machine.swap_tracker = self.swaps
+        except Exception:                              # pragma: no cover
+            self.swaps = None
         self.a = arena
         # Small constants the flag builders ask for on **every** arithmetic instruction, kept as
         # node ids. `a.const(k, width)` builds a tuple and hashes it, and a profile of one
@@ -1883,12 +1891,49 @@ def _h_test(L: Lifter, insn, ip, nxt):
 
 
 def _h_xchg(L: Lifter, insn, ip, nxt):
+    """`xchg` -- and the one place a pair of them can be proved to do nothing.
+
+    The handlers are built from `xchg`/`not` pairs (760 k `not` and 730 k `xchg`
+    against 1.02 M `mov` in 600 sampled handler functions of the DeltaForce build),
+    so a cancelled pair is worth removing at the source: `Machine.set_reg` rebuilds
+    sub-64-bit registers out of `and`/`or`/`shl`, and those rebuilds cannot be folded
+    afterwards, which is how a two-instruction no-op becomes a permanent widening
+    ladder in the value DAG.
+
+    Cancellation is delegated to `mba.SwapTracker`, which only claims it when the
+    same register pair is swapped twice with no write to either in between. When it
+    fires, both registers have already been restored to the refs they held before the
+    first swap, so the right thing to do is nothing at all.
+    """
     w = L.op_width(insn, 0)
+    pair = _xchg_register_pair(insn)
+    tracker = getattr(L.m, "swap_tracker", None)
+    if pair is not None and tracker is not None:
+        if tracker.should_cancel(pair[0], pair[1], w):
+            return "next", nxt
+        saved = tracker.snapshot(pair[0], pair[1])
+    else:
+        saved = None
     x = L.read_op(insn, 0)
     y = L.read_op(insn, 1)
     L.write_op(insn, 0, y, w)
     L.write_op(insn, 1, x, w)
+    if pair is not None and tracker is not None and saved is not None:
+        # Recorded *after* the writes: the two writes are this swap's own effect and
+        # must not invalidate the record the way a third-party write would.
+        tracker.remember(pair[0], pair[1], w, saved)
     return "next", nxt
+
+
+def _xchg_register_pair(insn):
+    """`(reg0, reg1)` when both operands are registers, else None."""
+    try:
+        ops = insn.operands
+        if len(ops) != 2 or ops[0].type != CS_OP_REG or ops[1].type != CS_OP_REG:
+            return None
+        return insn.reg_name(ops[0].reg), insn.reg_name(ops[1].reg)
+    except Exception:
+        return None
 
 
 def _shift(op_name):
