@@ -8,9 +8,7 @@
 
 >⚠️ **免责声明：** 本项目仅用于获得授权的安全研究、互操作性分析和教育，不包含或提供商业反作弊系统的绕过功能。使用者须确保拥有分析目标二进制文件的合法权利。
 
-面向 Tencent VM 的虚拟化还原工具。从 `.tvm0` 段恢复虚拟化代码，提取每个 VM handler 对 guest 寄存器和内存做了什么，并能把还原出的函数写回二进制，作为一个普通的只读可执行段。
-
-它是工具：给它一个模块，拿回结构和代码。
+面向 Tencent VM 的虚拟化还原工具。从 `.tvm0` 段恢复虚拟化代码，提取每个 VM handler 对 guest 寄存器和内存做了什么，并能把还原出的函数写回二进制，作为只读可执行段，从而恢复PE便于读取。
 
 ```
 .tvm0 段  ->  VM 语义  ->  guest 级 listing  ->  LLVM IR  ->  打过补丁的 PE
@@ -36,10 +34,8 @@
 | `ACE-GAME.sys` | 91 | 67 | **73.63%** |
 | `ACE-SSC-DRV64.sys` | 192 | 162 | **84.38%** |
 
-<details>
-<summary>查看更多组件的控制流对比</summary>
 
-下表统计参考工具找到的跳转中，本工具恢复了多少。它衡量控制流覆盖程度，与上表的函数恢复比例分开统计。
+下表统计参考工具找到的跳转中恢复数量。衡量控制流覆盖程度，与上表的函数恢复比例分开统计。
 
 | 组件 | 跳转恢复比例 |
 | --- | ---: |
@@ -59,7 +55,7 @@
 | `SGuard\x64\ACE-Trace.dll` | **0.00%** |
 | `ACE-Service64.exe` | **100.00%** |
 
-</details>
+
 
 ## 构建
 
@@ -225,9 +221,8 @@ out/               工具输出（已 gitignore）
 ## 范围
 
 guest context 的布局是通过测量得出的，不是假设的：`probe.ctx_map` 报告在 store 处实测的 slot 与寄存器对应关系。一个块的标识是 `(handler, vip)` 这一对，而不只是 handler。
-
-关于输出**不**声称什么：listing 是 VM 做过什么的记录，不是反编译结果。未解析的 dispatch 会被如实报告为未解析，而不是猜一个。截断的运行会在文件头标记。`--caller-entry` 产出的是以那个调用者为前提的结果，payload 拒绝把它提升为通用还原。
+listing 是 VM 做过什么的记录，不是反编译结果。未解析的 dispatch 会被如实报告为未解析，而不是猜一个。截断的运行会在文件头标记。`--caller-entry` 产出的是以那个调用者为前提的结果，payload 拒绝把它提升为通用还原。
 
 ##  Thanks
 
-基于 [capstone](https://www.capstone-engine.org/) 做反汇编，基于 [llvmlite](https://llvmlite.readthedocs.io/) 做 LLVM 后端。
+基于 [capstone](https://www.capstone-engine.org/) 反汇编，基于 [llvmlite](https://llvmlite.readthedocs.io/) 做 LLVM 后端。
