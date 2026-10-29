@@ -1,27 +1,67 @@
+[中文](README.md)　 [English](README-EN.md)
+
 # tvm-recover
 
 [![DOI](https://zenodo.org/badge/DOI/10.5281/zenodo.23474767.svg)](https://doi.org/10.5281/zenodo.23474767)
 
-Related Zenodo record: [10.5281/zenodo.23474767](https://doi.org/10.5281/zenodo.23474767).
+关联 Zenodo 记录：[10.5281/zenodo.23474767](https://doi.org/10.5281/zenodo.23474767)。
 
->⚠️ **Disclaimer:** This project is intended strictly for authorized security research, interoperability analysis, and education. It does not include or provide any bypass functionality for commercial anti-cheat systems. Users are solely responsible for ensuring they have the legal right to analyze the target binaries.
+>⚠️ **免责声明：** 本项目仅用于获得授权的安全研究、互操作性分析和教育，不包含或提供商业反作弊系统的绕过功能。使用者须确保拥有分析目标二进制文件的合法权利。
 
-A devirtualizer for Tencent VM . Recovers the virtualized code in a `.tvm0`
-section, lifts what each VM handler does to the guest's registers and memory, and can write the
-recovered functions back into the binary as a normal read+execute section.
+面向 Tencent VM 的虚拟化还原工具。从 `.tvm0` 段恢复虚拟化代码，提取每个 VM handler 对 guest 寄存器和内存做了什么，并能把还原出的函数写回二进制，作为一个普通的只读可执行段。
 
-It is a tool: point it at a module, get structure and code back out.
-
+它是工具：给它一个模块，拿回结构和代码。
 
 ```
-.tvm0 section  ->  VM semantics  ->  guest-level listing  ->  LLVM IR  ->  patched PE
+.tvm0 段  ->  VM 语义  ->  guest 级 listing  ->  LLVM IR  ->  打过补丁的 PE
 ```
 
-Devirtualized listing of a VM root, with the guest register file bound across blocks.
+某个 VM root 的还原后 listing，guest 寄存器组在跨块绑定后的形式。
 
-![Devirtualization result](img/devirt_listing.png)
+![虚拟化还原效果图](img/devirt_listing.png)
 
-## Build
+## 各组件恢复效果
+
+下表按**成功生成机器码的函数数**计算恢复比例。生成的代码均通过了与项目解释器的结果对比。
+
+| 组件 | 候选函数 | 已生成代码 | 恢复比例 |
+| --- | ---: | ---: | ---: |
+| `ACE-ADVT.sys` | 37 | 35 | **94.59%** |
+| `ACE-ADVT-1.0.2604.17113.sys` | 37 | 34 | **91.89%** |
+| `ACE-BASE.sys` | 274 | 254 | **92.70%** |
+| `ACE-BOOT.sys` | 112 | 101 | **90.18%** |
+| `ACE-CORE.sys` | 157 | 137 | **87.26%** |
+| `ACE-CORE.sys2` | 102 | 85 | **83.33%** |
+| `ACE-CORE.sys3` | 140 | 121 | **86.43%** |
+| `ACE-GAME.sys` | 91 | 67 | **73.63%** |
+| `ACE-SSC-DRV64.sys` | 192 | 162 | **84.38%** |
+
+<details>
+<summary>查看更多组件的控制流对比</summary>
+
+下表统计参考工具找到的跳转中，本工具恢复了多少。它衡量控制流覆盖程度，与上表的函数恢复比例分开统计。
+
+| 组件 | 跳转恢复比例 |
+| --- | ---: |
+| `ACE-CORE.sys3` | **95.05%** |
+| `ACE-CORE.sys` | **83.52%** |
+| `ACE-CORE.sys2` | **92.24%** |
+| `ACE-GAME.sys` | **94.37%** |
+| `ACE-IDS64.dll` | **91.43%** |
+| `ACE-CSI64.dll` | **95.86%** |
+| `ACE-PBC-Game64.dll` | **99.79%** |
+| `ACE-ATS64.dll` | **94.03%** |
+| `ACE-BASE.sys` | **96.46%** |
+| `SGuardAgent64.dll` | **100.00%** |
+| `SGuard\x64\SGuard64.exe` | **95.47%** |
+| `SGuard\x64\SGuardSvc64.exe` | **100.00%** |
+| `SGuard\x64\SGuardUpdate64.exe` | **100.00%** |
+| `SGuard\x64\ACE-Trace.dll` | **0.00%** |
+| `ACE-Service64.exe` | **100.00%** |
+
+</details>
+
+## 构建
 
 ```bash
 python -m venv .venv
@@ -29,75 +69,71 @@ source .venv/Scripts/activate      # Windows: .venv\Scripts\Activate.ps1
 pip install -r requirements.txt
 ```
 
-Python **3.13**, `capstone`. For the backend: `llvmlite==0.50.0` and, on Windows, MSVC
-`link.exe`/`cl.exe`. `z3-solver` is optional — without it path conditioning stays and only the
-bounded dispatch proof is skipped.
+Python **3.13**、`capstone`。后端另需 `llvmlite==0.50.0`，Windows 上还需 MSVC `link.exe`/`cl.exe`。`z3-solver` 可选 —— 没有它时路径条件化仍在，只跳过有界 dispatch 证明。
 
-## Configuration
+## 配置
 
-Copy `.env.example` to `.env` and fill in the paths for this machine. `.env` is git-ignored, and
-every setting also has a command-line flag, so the file only supplies defaults.
+把 `.env.example` 复制为 `.env`，填上本机路径。`.env` 已 gitignore；每个配置项也都有命令行参数，文件只是提供默认值。
 
-| key | meaning |
+| 键 | 含义 |
 | --- | --- |
-| `TVM_MODULE` | the module to analyse, for probes run without a positional argument |
-| `TVM_LISTINGS` | listing corpus the backend reads |
-| `TVM_OUT` | root for all output (default `out/`) |
-| `TVM_STEPS` | steps per block before a block is truncated (default `900000`) |
-| `TVM_BLOCKS` | block budget per root (default `512`) |
-| `TVM_PAYLOAD_OPT` | payload codegen level `0`–`3` |
-| `TVM_PAYLOAD_MEM` | `sealed` \| `absolute` guest-memory mode |
-| `TVM_MSVC_BIN` | directory holding `link.exe`/`cl.exe`, instead of relying on `PATH` |
+| `TVM_MODULE` | 分析目标，供不带位置参数的 probe 使用 |
+| `TVM_LISTINGS` | 后端读取的 listing 目录 |
+| `TVM_OUT` | 所有输出的根目录（默认 `out/`） |
+| `TVM_STEPS` | 每块步数上限，触顶即截断（默认 `900000`） |
+| `TVM_BLOCKS` | 每 root 块预算（默认 `512`） |
+| `TVM_PAYLOAD_OPT` | payload codegen 级别 `0`–`3` |
+| `TVM_PAYLOAD_MEM` | `sealed` \| `absolute` guest 内存模式 |
+| `TVM_MSVC_BIN` | 存放 `link.exe`/`cl.exe` 的目录，免去依赖 `PATH` |
 
-Precedence: command-line flag → `.env` → environment → built-in default.
+优先级：命令行参数 → `.env` → 环境变量 → 内置默认值。
 
-## Usage
+## 用法
 
-Engine commands run from `engine/`; backend commands from the repository root.
+引擎命令在 `engine/` 下执行；后端命令在仓库根目录执行。
 
-### Find the virtualized code
+### 找虚拟化代码
 
 ```bash
 cd engine
-python -m probe.scan_tvm0 /path/to/dir        # which files carry a .tvm0, and its roots
-python -m probe.trampoline_forms input.exe    # what the entry trampolines look like
-python -m probe.mnemonic_census input.exe     # what x86 the VM contains
+python -m probe.scan_tvm0 /path/to/dir        # 哪些文件带 .tvm0，以及它的 root
+python -m probe.trampoline_forms input.exe    # 入口跳板长什么样
+python -m probe.mnemonic_census input.exe     # VM 里包含哪些 x86
 ```
 
-### Devirtualize
+### 还原
 
 ```bash
 python -m core.devirt input.exe --out ../out/listings
 ```
 
-One `0x<root>.txt` listing and one `0x<root>.guest-state.json` per function. Options:
+每个函数产出一个 `0x<root>.txt` listing 和一个 `0x<root>.guest-state.json`。选项：
 
-| flag | default | meaning |
+| 选项 | 默认 | 含义 |
 | --- | --- | --- |
-| `--out=DIR` | stdout | write listings + guest state |
-| `--root=0x…` | all discovered | restrict to one VM entry |
-| `--show[=N]` | off | print the first N lines |
-| `--steps=N` | `900000` | steps per block before truncation |
-| `--blocks=N` | `512` | block budget per root |
-| `--caller-entry=0x… --call-site=0x…` | off | caller-specialize the entry |
+| `--out=DIR` | stdout | 写出 listing 与 guest state |
+| `--root=0x…` | 全部发现的 | 只处理一个 VM 入口 |
+| `--show[=N]` | 关 | 打印前 N 行 |
+| `--steps=N` | `900000` | 每块步数上限，触顶即截断 |
+| `--blocks=N` | `512` | 每 root 块预算 |
+| `--caller-entry=0x… --call-site=0x…` | 关 | 对入口做 caller 特化 |
 
-The header of each listing says whether the run was **truncated**; a truncated listing is a lower
-bound, not the function.
+每个 listing 的头部会写明这次运行是否**被截断**；截断的 listing 是下界，不是完整函数。
 
-### Understand one function
+### 理解单个函数
 
 ```bash
-python -m probe.cfg_run         input.exe 0x14015fc2e    # walk it, print the CFG
-python -m probe.guest_effect    input.exe 0x14015fc2e    # what handlers do to guest registers
-python -m probe.ctx_map         input.exe 0x14015fc2e    # which context slot holds which register
+python -m probe.cfg_run         input.exe 0x14015fc2e    # 走一遍，打印 CFG
+python -m probe.guest_effect    input.exe 0x14015fc2e    # handler 对 guest 寄存器的效果
+python -m probe.ctx_map         input.exe 0x14015fc2e    # 哪个 context slot 存哪个 guest 寄存器
 
-python -m probe.why_unresolved  input.exe 0x14015fc2e    # why a dispatch did not resolve
-python -m probe.block_exits     input.exe 0x14015fc2e    # why a block has no successor
-python -m probe.stop_debug      input.exe 0x14015fc2e    # why evaluation stopped
-python -m probe.unresolved_detail input.exe 0x14015fc2e  # per-block detail
+python -m probe.why_unresolved  input.exe 0x14015fc2e    # 某个 dispatch 为什么没解出
+python -m probe.block_exits     input.exe 0x14015fc2e    # 某个块为什么没有后继
+python -m probe.stop_debug      input.exe 0x14015fc2e    # 求值为什么停下
+python -m probe.unresolved_detail input.exe 0x14015fc2e  # 逐块细节
 ```
 
-Drill into a specific value or store:
+追到具体某个值或某次写入：
 
 ```bash
 python -m probe.trace_window    input.exe 0x14015fc2e 0x14015fc40 0x14015fc90
@@ -107,16 +143,15 @@ python -m probe.flags_at        input.exe 0x14015fc2e 0x14015fc60
 python -m probe.stack_at        input.exe 0x14015fc2e
 ```
 
-### Write it back into the binary
+### 写回二进制
 
 ```powershell
 .\write-devirt.ps1 -Module 'C:\path\to\SGuardSvc64.exe'
 ```
 
-Runs payload → inject → load → differential and stops at the first stage that fails. Options:
-`-Listings`, `-Out`, `-Opt 0..3`, `-Mem sealed|absolute`, `-SkipDifferential`, `-Force`.
+依次跑 payload → 注入 → 加载 → 差分，遇到第一个失败就停下。选项：`-Listings`、`-Out`、`-Opt 0..3`、`-Mem sealed|absolute`、`-SkipDifferential`、`-Force`。
 
-The stages individually:
+也可以逐个阶段单独跑：
 
 ```bash
 cd llvm
@@ -126,14 +161,11 @@ python miniload.py ../out/write-devirt/input.neko.exe
 python diff_payload.py --payload=../out/write-devirt --patched=../out/write-devirt/input.neko.exe
 ```
 
-`diff_payload.py` is the check that matters: it runs the code **inside the patched image** and
-compares it byte for byte against the interpreter over the same listing. `miniload.py` only proves
-the image loads and its entry runs.
+真正有意义的是 `diff_payload.py`：它运行**打过补丁的镜像里的**代码，与解释器在同一 listing 上逐字节比对。`miniload.py` 只证明镜像能加载、入口能跑。
 
-## How the VM works
+## VM 是怎么工作的
 
-ACE replaces a native function with a trampoline into a VM dispatcher. The dispatcher executes
-native x86 handlers, but the protected function's architectural state lives in the VM context.
+ACE 用一个跳板替换原生函数，跳入 VM dispatcher。dispatcher 执行的是原生 x86 handler，但被保护函数的体系结构状态存放在 VM context 中。
 
 ```mermaid
 flowchart TB
@@ -141,22 +173,22 @@ flowchart TB
         direction LR
 
         subgraph TEXT[.text]
-            ENTRY["<b>Function entry</b><br/>jump to VM entry"]
+            ENTRY["<b>函数入口</b><br/>跳转到 VM entry"]
         end
 
-        subgraph VM[.tvm0 section]
+        subgraph VM[.tvm0 段]
             direction LR
-            CORE["<b>Shared dispatcher and handlers</b><br/>execute x86 - resolve next handler"]
+            CORE["<b>共享 dispatcher 与 handlers</b><br/>执行 x86 - 解析下一个 handler"]
             CTX["<b>Guest context</b><br/>GPRs - RFLAGS - VIP"]
             CORE <--> CTX
         end
     end
 
-    subgraph NATIVE[Native execution outside the VM]
+    subgraph NATIVE[VM 之外的原生执行]
         direction LR
-        BOXED["<b>Boxed instruction</b><br/>execute original x86"]
-        CALL["<b>Guest call</b><br/>invoke native target"]
-        EXIT["<b>Guest return or tail call</b><br/>resume native execution"]
+        BOXED["<b>Boxed 指令</b><br/>执行原始 x86"]
+        CALL["<b>Guest 调用</b><br/>调用原生目标"]
+        EXIT["<b>Guest 返回或尾调用</b><br/>恢复原生执行"]
         BOXED ~~~ CALL ~~~ EXIT
     end
 
@@ -166,54 +198,36 @@ flowchart TB
     style TOP fill:transparent,stroke:transparent
 ```
 
-Some operations execute outside the VM. A **boxed instruction** runs its original x86 encoding after
-the VM restores the registers it needs, then returns its effects to the guest context. A **guest
-call** invokes a native target and resumes with the return value and Windows x64 ABI clobbers
-represented in guest state. Guest returns and tail calls leave the dispatcher entirely.
+部分操作在 VM 之外执行。**Boxed 指令**在 VM 恢复它所需的寄存器后执行原始 x86 编码，再把效果写回 guest context。**Guest 调用**调用一个原生目标，返回时把返回值与 Windows x64 ABI 的 clobber 体现在 guest 状态里。Guest 返回与尾调用则完全离开 dispatcher。
 
-The context holds all sixteen guest general-purpose registers, including the guest `RSP`, plus
-packed guest flags. Its layout varies by protector build, so it is located by observing the VM's
-save/restore behaviour rather than assumed — `probe.ctx_map` reports the mapping measured at the
-stores, and every emitted listing brackets a context access with its slot offset.
+context 包含全部十六个 guest 通用寄存器（含 guest `RSP`），以及打包的 guest 标志位。它的布局随保护版本变化，因此是通过观察 VM 的保存/恢复行为定位的，而不是假设固定地址 —— `probe.ctx_map` 报告在 store 处实测的映射，且每个输出的 listing 都会给 context 访问标注 slot 偏移。
 
-Conditional control flow is dispatch arithmetic: a handler extracts a guest flag or predicate, uses
-it to pick the next virtual program counter, and computes the next handler's address. The
-devirtualizer evaluates that symbolically and forks when the choice depends on an unresolved guest
-value. A block's identity is the pair `(handler, vip)`, not the handler alone.
+条件控制流通过 dispatch 算术实现：handler 取出一个 guest 标志或谓词，用它选出下一个虚拟程序计数器，再算出下一个 handler 的地址。还原器符号化地求值这一过程，并在所选路径依赖未解析 guest 值时分裂求值状态。一个块的标识是 `(handler, vip)` 这一对，而不只是 handler。
 
-The recovery rests on one rule: **identify a value by what the machine did, not by the name an
-analysis gave it.** Register propagation across blocks is carried in the listing as an annotation,
-never as evidence — permuting every register version number in a listing must not change the parsed
-structure.
+整个还原建立在一条规则上：**按机器实际做了什么来识别值，而不是按分析给它的名字。** 跨块寄存器传播在 listing 中以注解形式携带，绝不作为证据 —— 把 listing 里每个寄存器版本号任意置换后，解析出的结构必须不变。
 
-## Layout
+## 结构
 
 ```text
-write-devirt.ps1   one command: payload -> patched PE -> differential
-.env.example       configuration template; copy to .env
-envfile.py         .env parser; bootenv.py loads it for llvm/, engine/envboot.py for probes
-engine/core/       PE parsing, expression arena, x86-64 lifting, machine model,
-                   guest context, CFG recovery, guest IR, guest-state programs
-engine/probe/      28 probes - each answers one question about the target
-engine/tests/      30 suites, all on synthetic fixtures or independent Python arithmetic
-llvm/              listing grammar, IR -> LLVM IR, interpreter, differential,
-                   payload builder, PE/PDB editor, injector, loader
-llvm/runtime/      the code the payload calls: sealed memory, entry stub, __chkstk
-out/               tool output (git-ignored)
+write-devirt.ps1   一条命令：payload -> 打过补丁的 PE -> 差分
+.env.example       配置模板；复制为 .env
+envfile.py         .env 解析；bootenv.py 供 llvm/ 加载，engine/envboot.py 供 probe 加载
+engine/core/       PE 解析、表达式 arena、x86-64 lifting、机器模型、
+                   guest context、CFG 恢复、guest IR、guest-state 程序
+engine/probe/      28 个 probe —— 每个回答一个关于目标的问题
+engine/tests/      30 个套件，全部基于合成 fixture 或 Python 独立算术对照
+llvm/              listing 文法、IR -> LLVM IR、解释器、差分、
+                   payload 构建、PE/PDB 编辑、注入、加载
+llvm/runtime/      payload 调用的代码：密封内存、入口桩、__chkstk
+out/               工具输出（已 gitignore）
 ```
 
-## Scope
+## 范围
 
-The guest context layout is derived by measurement, not assumed: `probe.ctx_map` reports which
-context slot holds which guest register, measured at the stores. A block's identity is the pair
-`(handler, vip)`, not the handler alone.
+guest context 的布局是通过测量得出的，不是假设的：`probe.ctx_map` 报告在 store 处实测的 slot 与寄存器对应关系。一个块的标识是 `(handler, vip)` 这一对，而不只是 handler。
 
-What the output does not claim: a listing is a record of what the VM did, not a decompilation.
-An unresolved dispatch is reported as unresolved rather than guessed. A truncated run is marked in
-the file header. `--caller-entry` produces a result conditional on that caller, and the payload
-refuses to promote it to a general recovery.
+关于输出**不**声称什么：listing 是 VM 做过什么的记录，不是反编译结果。未解析的 dispatch 会被如实报告为未解析，而不是猜一个。截断的运行会在文件头标记。`--caller-entry` 产出的是以那个调用者为前提的结果，payload 拒绝把它提升为通用还原。
 
-## Credits
+##  Thanks
 
-Built on [capstone](https://www.capstone-engine.org/) for disassembly and
-[llvmlite](https://llvmlite.readthedocs.io/) for the LLVM backend.
+基于 [capstone](https://www.capstone-engine.org/) 做反汇编，基于 [llvmlite](https://llvmlite.readthedocs.io/) 做 LLVM 后端。

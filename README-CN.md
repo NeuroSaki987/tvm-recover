@@ -1,10 +1,12 @@
+[中文](README.md)　 [English](README-EN.md)
+
 # tvm-recover
 
 [![DOI](https://zenodo.org/badge/DOI/10.5281/zenodo.23474767.svg)](https://doi.org/10.5281/zenodo.23474767)
 
 关联 Zenodo 记录：[10.5281/zenodo.23474767](https://doi.org/10.5281/zenodo.23474767)。
 
->⚠️ **Disclaimer:** This project is intended strictly for authorized security research, interoperability analysis, and education. It does not include or provide any bypass functionality for commercial anti-cheat systems. Users are solely responsible for ensuring they have the legal right to analyze the target binaries.
+>⚠️ **免责声明：** 本项目仅用于获得授权的安全研究、互操作性分析和教育，不包含或提供商业反作弊系统的绕过功能。使用者须确保拥有分析目标二进制文件的合法权利。
 
 面向 Tencent VM 的虚拟化还原工具。从 `.tvm0` 段恢复虚拟化代码，提取每个 VM handler 对 guest 寄存器和内存做了什么，并能把还原出的函数写回二进制，作为一个普通的只读可执行段。
 
@@ -17,6 +19,47 @@
 某个 VM root 的还原后 listing，guest 寄存器组在跨块绑定后的形式。
 
 ![虚拟化还原效果图](img/devirt_listing.png)
+
+## 各组件恢复效果
+
+下表按**成功生成机器码的函数数**计算恢复比例。生成的代码均通过了与项目解释器的结果对比。
+
+| 组件 | 候选函数 | 已生成代码 | 恢复比例 |
+| --- | ---: | ---: | ---: |
+| `ACE-ADVT.sys` | 37 | 35 | **94.59%** |
+| `ACE-ADVT-1.0.2604.17113.sys` | 37 | 34 | **91.89%** |
+| `ACE-BASE.sys` | 274 | 254 | **92.70%** |
+| `ACE-BOOT.sys` | 112 | 101 | **90.18%** |
+| `ACE-CORE.sys` | 157 | 137 | **87.26%** |
+| `ACE-CORE.sys2` | 102 | 85 | **83.33%** |
+| `ACE-CORE.sys3` | 140 | 121 | **86.43%** |
+| `ACE-GAME.sys` | 91 | 67 | **73.63%** |
+| `ACE-SSC-DRV64.sys` | 192 | 162 | **84.38%** |
+
+<details>
+<summary>查看更多组件的控制流对比</summary>
+
+下表统计参考工具找到的跳转中，本工具恢复了多少。它衡量控制流覆盖程度，与上表的函数恢复比例分开统计。
+
+| 组件 | 跳转恢复比例 |
+| --- | ---: |
+| `ACE-CORE.sys3` | **95.05%** |
+| `ACE-CORE.sys` | **83.52%** |
+| `ACE-CORE.sys2` | **92.24%** |
+| `ACE-GAME.sys` | **94.37%** |
+| `ACE-IDS64.dll` | **91.43%** |
+| `ACE-CSI64.dll` | **95.86%** |
+| `ACE-PBC-Game64.dll` | **99.79%** |
+| `ACE-ATS64.dll` | **94.03%** |
+| `ACE-BASE.sys` | **96.46%** |
+| `SGuardAgent64.dll` | **100.00%** |
+| `SGuard\x64\SGuard64.exe` | **95.47%** |
+| `SGuard\x64\SGuardSvc64.exe` | **100.00%** |
+| `SGuard\x64\SGuardUpdate64.exe` | **100.00%** |
+| `SGuard\x64\ACE-Trace.dll` | **0.00%** |
+| `ACE-Service64.exe` | **100.00%** |
+
+</details>
 
 ## 构建
 
