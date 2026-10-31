@@ -110,7 +110,7 @@ python -m probe.mnemonic_census input.exe     # what x86 the VM contains
 ### Devirtualize
 
 ```bash
-python -m core.devirt input.exe --out ../out/listings
+python -m core.devirt input.exe --out=../out/listings
 ```
 
 One `0x<root>.txt` listing and one `0x<root>.guest-state.json` per function. Options:

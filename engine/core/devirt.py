@@ -10,8 +10,8 @@ This is that entry point. It is in `core` rather than in `probe` because it is t
 capability that only a probe can exercise is not one the engine has.
 
     python -m core.devirt <module>                 # every root, listing to stdout
-    python -m core.devirt <module> --out DIR       # one file per function
-    python -m core.devirt <module> --root 0x14015fc2e --show
+    python -m core.devirt <module> --out=DIR       # one file per function
+    python -m core.devirt <module> --root=0x14015fc2e --show
 
 Notes that matter for reading the output:
 
@@ -613,6 +613,8 @@ def branch_condition(block, cond_name: str = "") -> str:
     the line it saw before.
     """
     text = getattr(block, 'predicate', '') or ''
+    if len(text) > 400:
+        text = text[:400] + '...'
     cond = list(getattr(block, 'edge_cond', ()) or ())
     succs = list(block.succs or ())
     if not text and not cond_name:
@@ -625,7 +627,7 @@ def branch_condition(block, cond_name: str = "") -> str:
                 f'   ; successor when 0: {by_value[0]}'
                 f'   ; successor when 1: {by_value[1]}')
         if text:
-            line += f'   ; from {text[:400]}'
+            line += f'   ; from {text}'
         return line
     return ('; branch condition: ' + (text or '<unnamed>')
             + f'   ; one successor of {len(succs)} selected by this condition')
