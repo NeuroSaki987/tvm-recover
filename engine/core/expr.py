@@ -1700,41 +1700,66 @@ def _fold_bin(op: str, a: int, b: int, width: int) -> int:
     raise KeyError(op)
 
 
-def render(arena: Arena, r: int, limit: int = 200) -> str:
-    """Readable dump of a node, for diagnostics and evidence files."""
-    memos: dict[int, str] = {}
+def render(arena: Arena, r: int, limit: int = 200, *, max_chars: int = 4096) -> str:
+    """Bounded diagnostic text; never materialize the expanded expression tree.
 
-    def go(x: int, depth: int) -> str:
-        if x in memos:
-            return memos[x]
-        if depth > 24:
-            return "..."
-        n = arena.nodes[x]
-        t = n[0]
-        if t == "c":
-            w = n[2]
-            s = f"{n[1]:#x}" if n[1] > 9 else str(n[1])
-        elif t == "init":
-            s = f"in.{n[1]}"
-        elif t == "param":
-            s = f"p{n[1]}.{n[2]}"
-        elif t == "opaque":
-            s = n[1]
-        elif t == "load":
-            s = f"*{go(n[1], depth + 1)}:{n[2]}"
-        elif t == "bin":
-            s = f"({go(n[2], depth + 1)} {n[1]} {go(n[3], depth + 1)})"
-        elif t == "un":
-            s = f"{n[1]}({go(n[2], depth + 1)})"
-        elif t in ("trunc", "zext", "sext"):
-            s = f"{t}{n[2]}({go(n[1], depth + 1)})"
-        elif t == "sel":
-            s = f"({go(n[1], depth + 1)} ? {go(n[2], depth + 1)} : {go(n[3], depth + 1)})"
+    ``limit`` bounds node visits, including repeated occurrences of a shared node.
+    ``max_chars`` bounds the returned string. ``...`` marks any omitted content;
+    expression refs used for recovery and lowering are left untouched.
+    """
+    if max_chars < 3:
+        raise ValueError("max_chars must leave room for the omission marker")
+    parts: list[str] = []
+    length = visits = 0
+    # Tokens are emitted directly, rather than concatenating rendered children.
+    # The depth bound also keeps the pending token stack small on deep DAGs.
+    pending = [(True, r, 0)]
+    truncated = False
+    while pending:
+        is_ref, value, depth = pending.pop()
+        if is_ref:
+            if visits >= limit:
+                truncated = True
+                break
+            visits += 1
+            if depth > 24:
+                pending.append((False, "...", depth))
+                continue
+            n = arena.nodes[value]
+            t = n[0]
+            child = lambda ref: (True, ref, depth + 1)
+            text = lambda token: (False, token, depth)
+            if t == "c":
+                tokens = [text(f"{n[1]:#x}" if n[1] > 9 else str(n[1]))]
+            elif t == "init":
+                tokens = [text("in."), text(n[1])]
+            elif t == "param":
+                tokens = [text("p"), text(str(n[1])), text("."), text(str(n[2]))]
+            elif t == "opaque":
+                tokens = [text(n[1])]
+            elif t == "load":
+                tokens = [text("*"), child(n[1]), text(f":{n[2]}")]
+            elif t == "bin":
+                tokens = [text("("), child(n[2]), text(" "), text(n[1]),
+                          text(" "), child(n[3]), text(")")]
+            elif t == "un":
+                tokens = [text(n[1]), text("("), child(n[2]), text(")")]
+            elif t in ("trunc", "zext", "sext"):
+                tokens = [text(f"{t}{n[2]}("), child(n[1]), text(")")]
+            elif t == "sel":
+                tokens = [text("("), child(n[1]), text(" ? "), child(n[2]),
+                          text(" : "), child(n[3]), text(")")]
+            else:
+                # Do not repr an arbitrary node tuple: its payload may be large.
+                tokens = [text("<"), text(t), text(f" n{value}>")]
+            pending.extend(reversed(tokens))
         else:
-            s = str(n)
-        if len(memos) > limit:
-            return s
-        memos[x] = s
-        return s
-
-    return go(r, 0)
+            remaining = max_chars - length
+            if len(value) > remaining:
+                parts.append(value[:remaining])
+                truncated = True
+                break
+            parts.append(value)
+            length += len(value)
+    result = "".join(parts)
+    return result[:max_chars - 3] + "..." if truncated else result

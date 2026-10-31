@@ -100,7 +100,7 @@ python -m probe.mnemonic_census input.exe     # VM 里包含哪些 x86
 ### 还原
 
 ```bash
-python -m core.devirt input.exe --out ../out/listings
+python -m core.devirt input.exe --out=../out/listings
 ```
 
 每个函数产出一个 `0x<root>.txt` listing 和一个 `0x<root>.guest-state.json`。选项：
