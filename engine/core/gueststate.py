@@ -39,10 +39,13 @@ def observe(machine, ctx, image_u8, snapshot=None):
     """
     observer = copy(machine)
     source = snapshot or machine
+    observer.regs = dict(source.regs)
+    observer.flags = dict(source.flags)
+    lo, hi = (ctx.span if getattr(ctx, "memory_backed", False) else (0, 0))
     observer.mem = ({addr: value for addr, value in source.mem.items()
-                     if ctx.base <= addr < ctx.base + 17 * 8} if ctx else {})
+                     if lo <= addr < hi} if ctx else {})
     observer.byte_versions = ({addr: version for addr, version in source.byte_versions.items()
-                              if ctx.base <= addr < ctx.base + 17 * 8} if ctx else {})
+                              if lo <= addr < hi} if ctx else {})
     observer.pending_isolated = list(source.pending_isolated)
     observer.clobbered_ranges = list(source.clobbered_ranges)
     observer.mem_version = source.mem_version
@@ -56,7 +59,41 @@ def capture(machine, ctx, image_u8, snapshot=None):
     """Read all physical slots on a private observer; no hooks or log mutations."""
     if ctx is None:
         return {}
+    if getattr(ctx, 'native_registers', False):
+        source = snapshot or machine
+        a = machine.a
+        result = {
+            reg: (a.zext(a.trunc(source.regs[reg], 32), 64)
+                  if reg in source.regs and not reg.startswith(('r8', 'r9', 'r1'))
+                  else a.const(0, 64))
+            for reg in REGS if reg != 'rflags'
+        }
+        observer = copy(machine)
+        observer.flags = dict(source.flags)
+        result['rflags'] = a.zext(a.trunc(observer.pack_flags(), 32), 64)
+        return result
+    if getattr(ctx, 'register_backed', False):
+        source = snapshot or machine
+        a = machine.a
+        result = {}
+        for reg in REGS:
+            if reg not in ctx.regs:
+                result[reg] = a.const(0, 64)
+                continue
+            if reg == 'rflags':
+                observer = copy(source)
+                result[reg] = a.zext(a.trunc(observer.pack_flags(), ctx.bits), 64)
+                continue
+            host = ctx.host_of(reg)
+            if host is None:
+                result[reg] = a.zext(
+                    a.opaque(f'guest32_missing.{reg}', 32), 64)
+                continue
+            value = source.reg(host, ctx.bits)
+            result[reg] = a.zext(a.trunc(value, ctx.bits), 64)
+        return result
     observer = copy(machine)
+    a = machine.a
     # Loads append diagnostics and increment guard counters. A shallow machine
     # copy isolates scalars; copies of mutable logs isolate all load side effects.
     observer.sym_loads = []
@@ -65,8 +102,16 @@ def capture(machine, ctx, image_u8, snapshot=None):
         for name in ('mem', 'mem_version', 'symbolic_window', 'byte_versions',
                      'pending_isolated', 'clobbered_ranges'):
             setattr(observer, name, getattr(snapshot, name))
-    return {reg: Machine.load_concrete(observer, ctx.addr_of(reg), 8, -2, image_u8)
-            for reg in REGS}
+    result = {}
+    for reg in REGS:
+        address = ctx.addr_of(reg)
+        if address is None:
+            result[reg] = a.const(0, 64)
+            continue
+        value = Machine.load_concrete(
+            observer, address, ctx.slot_bytes, -2, image_u8)
+        result[reg] = a.zext(value, 64) if ctx.slot_bytes < 8 else value
+    return result
 
 
 @dataclass
@@ -118,11 +163,15 @@ class Program:
             elif op in ('trunc', 'zext', 'sext'):
                 good = len(widths) == 1 and (widths[0] >= w if op == 'trunc' else widths[0] <= w)
             elif op == 'load':
-                good = widths == [64, 0] and w in (8, 16, 32, 64)
+                good = (len(widths) == 2 and widths[0] in (16, 32, 64)
+                        and widths[1] == 0 and w in (8, 16, 32, 64))
             elif op == 'store':
-                good = len(widths) == 3 and widths[:2] == [0, 64] and widths[2] >= node['bytes'] * 8 and w == 0
+                good = (len(widths) == 3 and widths[0] == 0
+                        and widths[1] in (16, 32, 64)
+                        and widths[2] >= node['bytes'] * 8 and w == 0)
             elif op == 'havoc':
-                good = widths == [0, 64] and w == 0
+                good = (len(widths) == 2 and widths[0] == 0
+                        and widths[1] in (16, 32, 64) and w == 0)
             if not good:
                 errors.append(f'node {ref}: invalid {op} widths {widths} -> {w}')
         for key, b in self.blocks.items():
@@ -254,8 +303,11 @@ class Program:
                 elif n['bytes'] == 0:
                     value.clear()
                 else:
-                    for i in range(n['bytes']):
-                        value.pop((addr + i) & ((1 << 64) - 1), None)
+                    address_mask = (1 << 64) - 1
+                    value = {
+                        address: byte for address, byte in value.items()
+                        if ((address - addr) & address_mask) >= n['bytes']
+                    }
             else:
                 raise ValueError(f'unsupported state node {op}')
             values[ref] = value & mask if w else value

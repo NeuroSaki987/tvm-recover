@@ -18,10 +18,10 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 
-from capstone import CS_ARCH_X86, CS_MODE_64, CS_OP_IMM, CS_OP_MEM, CS_OP_REG, Cs
+from capstone import CS_ARCH_X86, CS_MODE_32, CS_MODE_64, CS_OP_IMM, CS_OP_MEM, CS_OP_REG, Cs
 
 from .expr import W8, W16, W32, W64, Arena, boolean_subexpressions, sext_value
-from .guestctx import MATERIALISATION, GuestCache, GuestContext
+from .guestctx import HANDLER_TIME, MATERIALISATION, GuestCache, GuestContext
 from .mach import GP64 as GP64_NAMES
 from .mach import SUB, FLAGS, Machine, UnmodelledRegister, canon, condition
 from . import x86sum
@@ -79,6 +79,10 @@ _READ_ONLY_MEM = frozenset(
 _CET_NOOP = ("incsspq", "rdsspq", "saveprevssp", "rstorssp", "wrssq", "wrussq",
              "clrssbsy", "setssbsy", "endbr64", "endbr32")
 
+_STRING_MNEMONICS = frozenset(family + suffix for family in
+                            ('lods', 'stos', 'movs', 'cmps', 'scas')
+                            for suffix in ('b', 'w', 'd', 'q'))
+
 
 @dataclass
 class Stop:
@@ -105,6 +109,10 @@ class Boxed:
 
 
 class Lifter:
+    #: Exact PE32 call-next+1 return-address thunks are production control flow.
+    #: The seeded guest-cache probe disables them because its contract is to
+    #: preserve the pre-existing observation path while measuring register homes.
+    return_address_thunks = True
     #: Whether a bare `int3` counts as the VM leaving the virtualized function, when its
     #: shape says so. See `Lifter._guest_exit_trap`. Switchable so the A/B stays available.
     guest_exit_trap = True
@@ -150,8 +158,8 @@ class Lifter:
                  box_unmodelled: bool = True):
         self.img = img
         self.m = machine
-        # The `not`/`xchg` deobfuscation, installed on the machine so `set_reg` can
-        # report writes without `mach.py` needing to know what they are for.
+        # The `not`/`xchg` deobfuscation is installed on the machine so `set_reg`
+        # can report writes without `mach.py` depending on the deobfuscation policy.
         try:
             from .mba import SwapTracker
             self.swaps = SwapTracker(machine)
@@ -170,7 +178,12 @@ class Lifter:
         self.vm_lo = vm_lo
         self.vm_hi = vm_hi
         self.box_unmodelled = box_unmodelled
-        self._md = Cs(CS_ARCH_X86, CS_MODE_64)
+        from .arch import Architecture
+        self.bits = Architecture.for_image(img).bits
+        self.ptr_bytes = self.bits // 8
+        self.sp = "rsp" if self.bits == 64 else "esp"
+        self.bp = "rbp" if self.bits == 64 else "ebp"
+        self._md = Cs(CS_ARCH_X86, CS_MODE_64 if self.bits == 64 else CS_MODE_32)
         self._md.detail = True
         self._cache: dict[int, tuple[int, object, bytes]] = {}
         self.events: list[object] = []
@@ -381,6 +394,30 @@ class Lifter:
         # state in `guest_only_address`, without any per-store flag changing how a store behaves.
         self._machine.guest_marks = self.guest_identity
 
+    def enable_register_guest_census(self, ctx) -> None:
+        """Name guest state carried directly by the native x86 register file."""
+        if not getattr(ctx, "register_backed", False):
+            raise ValueError("register census requires a register-backed context")
+        cache = GuestCache(HANDLER_TIME)
+        cache.ctx = ctx
+        for guest in ctx.regs:
+            host = ctx.host_of(guest)
+            if host is None:
+                continue
+            cache.note(canon(host)[0], guest)
+            value = self._machine.reg(host, ctx.bits)
+            self.guest_values.setdefault(value, guest)
+            self.gv_prov.setdefault(value, ("cache-seed", self.steps))
+            self.gv_first.setdefault(value, ("cache-seed", self.steps))
+            self.guest_identity.setdefault(value, guest)
+            for leaf in self.a.leaves(value):
+                if self.a.op(leaf) == "init":
+                    self.guest_values.setdefault(leaf, guest)
+                    self.gv_prov.setdefault(leaf, ("cache-seed", self.steps))
+                    self.gv_first.setdefault(leaf, ("cache-seed", self.steps))
+                    self.guest_identity.setdefault(leaf, guest)
+        self.enable_guest_census(ctx, cache)
+
     def _guest_set_reg(self, name, value, width=None):
         # Provenance, tracked **as a chain from a context read** rather than read off
         # the global cache map. `derive_guest_cache` measures which host register
@@ -396,7 +433,8 @@ class Lifter:
         # That is conservative in the right direction: it under-reports rather than
         # mis-reports, and the count of unattributed writes is what measures the gap.
         parent = canon(name)[0] if name else name
-        if width is None or width == 64:
+        native_width = getattr(self.guest_ctx, "bits", 64)
+        if width is None or width in (32, 64, native_width):
             # **Marking and attribution are different jobs, and only attribution must be
             # strict.** Marking asks "is this value guest state?" and may be liberal: a
             # value computed from exactly one known guest value *is* derived from it, and
@@ -414,7 +452,7 @@ class Lifter:
                 self.guest_values[value] = next(iter(_derived))
                 self.gv_prov[value] = ("derived", self.steps)
                 self.gv_first.setdefault(value, ("derived", self.steps))
-        if width is None or width == 64:
+        if width is None or width in (32, 64, native_width):
             # A guest register is updated when a register that was **carrying** it is
             # overwritten with something derived from what it held -- not when a value
             # that merely came from a guest register is written somewhere.
@@ -427,10 +465,10 @@ class Lifter:
             # parking intermediates in scratch. That is computation, not a guest
             # register being updated, and round 1 already said so: guest `rax` is not
             # cache-resident on this function.
-            prev = self._machine.reg(parent, 64)
+            prev = self._machine.reg(parent, native_width)
             carried = self.guest_values.get(prev)
             if carried is not None and (value == prev
-                                        or prev in self.a.leaves(value)):
+                                        or prev in self.a._descendants_ordered(value)):
                 # Second condition: the destination register must be where *this*
                 # guest register lives, per the handler-time cache. Without it the
                 # chain attributes scratch work -- measured at 6774 of 6942 writes.
@@ -472,7 +510,9 @@ class Lifter:
         rule does not apply to a four-byte write to memory.
         """
         ctx = self.guest_ctx
-        if ctx is None or nbytes not in (1, 2, 4, 8):
+        slot_bytes = getattr(ctx, "slot_bytes", 8) if ctx is not None else 8
+        if (ctx is None or not getattr(ctx, "memory_backed", False)
+                or nbytes not in (1, 2, 4, 8) or nbytes > slot_bytes):
             return None
         c = self.a.as_const(addr)
         if c is None:
@@ -480,12 +520,13 @@ class Lifter:
         offset = c - ctx.base
         if offset < 0 or offset + nbytes > ctx.span[1] - ctx.base:
             return None
-        inside = offset % 8
-        return ctx.reg_at(c - inside) if inside + nbytes <= 8 else None
+        inside = offset % slot_bytes
+        return ctx.reg_at(c - inside) if inside + nbytes <= slot_bytes else None
 
     def _wide(self, value: int, nbytes: int) -> int:
         """The value a guest register holds after an `nbytes`-wide write to its home."""
-        return value if nbytes == 8 else self.a.zext(value, 64)
+        slot_bytes = getattr(self.guest_ctx, "slot_bytes", 8)
+        return value if nbytes == slot_bytes else self.a.zext(value, 64)
 
     def _guest_ptr(self, addr: int) -> tuple[str, int] | None:
         """`(guest register, byte offset)` if this address is `guest_G + k`.
@@ -562,7 +603,8 @@ class Lifter:
             # it is matched against is the same width; the *guest* value is the widened one,
             # because that is what the register holds afterwards.
             self.guest_trace.append((self.steps, "load", (site, reg, v, addr, nbytes)))
-            if nbytes != 8:
+            slot_bytes = getattr(self.guest_ctx, "slot_bytes", 8)
+            if nbytes != slot_bytes:
                 # This is a slice of a slot, not the whole guest register.
                 self.guest_values.setdefault(v, reg)
                 self.gv_prov.setdefault(v, ("context-slice", self.steps))
@@ -640,7 +682,8 @@ class Lifter:
         c = self.a.as_const(addr)
         if c is not None:
             self.all_stores.append((site, c, nbytes, value))
-        if reg is not None and nbytes == 8:
+        slot_bytes = getattr(self.guest_ctx, "slot_bytes", 8)
+        if reg is not None and nbytes == slot_bytes:
             wide = self._wide(value, nbytes)
             self.guest_writes.append((site, reg, wide))
             self.guest_trace.append((self.steps, "store", (site, reg, wide)))
@@ -714,6 +757,10 @@ class Lifter:
         got = self._cache.get(ip)
         if got is not None:
             return got
+        if hasattr(self.img, '_file_offset') and self.img._file_offset(ip) is None:
+            # The data image exposes loader zero-fill, but it supplies no native
+            # instructions for a packed/runtime-populated virtual section tail.
+            return (0, None, b'')
         body = self.img.image_bytes(ip, 16)
         if not body:
             self._cache[ip] = (0, None, b"")
@@ -858,6 +905,7 @@ class Lifter:
         op = next((o for o in insn.operands if o.type == CS_OP_MEM), None)
         assert op is not None
         a = self.a
+        width = insn.addr_size * 8
         acc: int | None = None
         base_name = insn.reg_name(op.mem.base) if op.mem.base else None
         if base_name == "rip":
@@ -865,18 +913,23 @@ class Lifter:
             # the displacement, and the base register contributes nothing. This
             # must be handled before touching the register file, which has no
             # `rip` entry by design.
-            return a.const((insn.address + insn.size + op.mem.disp) & ((1 << 64) - 1), W64)
+            return a.const((insn.address + insn.size + op.mem.disp) & ((1 << width) - 1), width)
         if op.mem.base:
-            acc = self.m.reg(base_name, 64)
+            acc = self.m.reg(base_name, width)
         if op.mem.index:
-            idx = self.m.reg(insn.reg_name(op.mem.index), 64)
-            scaled = self.a.bin("mul", idx, self.a.const(op.mem.scale, W64), W64)
-            acc = scaled if acc is None else self.a.bin("add", acc, scaled, W64)
+            idx = self.m.reg(insn.reg_name(op.mem.index), width)
+            scaled = self.a.bin("mul", idx, self.a.const(op.mem.scale, width), width)
+            acc = scaled if acc is None else self.a.bin("add", acc, scaled, width)
         if op.mem.disp:
-            dv = self.a.const(op.mem.disp & ((1 << 64) - 1), W64)
-            acc = dv if acc is None else self.a.bin("add", acc, dv, W64)
+            dv = self.a.const(op.mem.disp & ((1 << width) - 1), width)
+            acc = dv if acc is None else self.a.bin("add", acc, dv, width)
         if acc is None:
-            acc = self.a.const(0, W64)
+            acc = self.a.const(0, width)
+        segment = insn.reg_name(op.mem.segment) if op.mem.segment else None
+        if segment in ('fs', 'gs'):
+            # Segment bases are runtime inputs, not the flat address zero.
+            acc = a.bin('add', a.opaque(f'{segment}_base', self.bits),
+                        a.zext(acc, self.bits), self.bits)
         return acc
 
     # ---------------------------------------------------------------- flags
@@ -1075,7 +1128,28 @@ class Lifter:
         if len(self.trace) > 4096:
             del self.trace[:2048]
         nxt = ip + size
+        # Capstone exposes some semantic-neutral prefixes as part of the
+        # mnemonic. They do not replace the instruction underneath. Leaving
+        # them in sent BND-prefixed Jcc/RET through the generic boxed path and
+        # kept LOCK CMPXCHG from reaching its register/memory semantics.
         mn = insn.mnemonic
+        if mn in ("repz ret", "repe ret", "rep ret"):
+            # The REP prefix is architecturally redundant on RET and is emitted
+            # by compilers as the AMD branch-prediction form.
+            mn = "ret"
+        while True:
+            if mn.startswith("xacquire "):
+                mn = mn[9:]
+            elif mn.startswith("xrelease "):
+                mn = mn[9:]
+            elif mn.startswith("notrack "):
+                mn = mn[8:]
+            elif mn.startswith("bnd "):
+                mn = mn[4:]
+            elif mn.startswith("lock "):
+                mn = mn[5:]
+            else:
+                break
 
         if mn in _CET_NOOP:
             # CET bookkeeping and endbr markers: no architectural effect the
@@ -1083,11 +1157,16 @@ class Lifter:
             return "next", nxt
 
         try:
+            if mn in _STRING_MNEMONICS or mn.startswith(('rep ', 'repe ', 'repne ')):
+                from .stringops import execute as execute_string
+                string_result = execute_string(self, insn, ip, nxt)
+                if string_result is not None:
+                    return string_result
             handler = _HANDLERS.get(mn)
             if handler is not None:
                 return handler(self, insn, ip, nxt)
             if mn in JCC:
-                return self._jcc(insn, ip, nxt)
+                return self._jcc(insn, ip, nxt, mn)
             if mn in SETCC:
                 v = condition(self.a, self.m, SETCC[mn])
                 self.write_op(insn, 0, v, 8)
@@ -1195,9 +1274,10 @@ class Lifter:
             return None
         return Stop("return", ip, text="int3 guest-exit trap")
 
-    def _jcc(self, insn, ip: int, nxt: int) -> tuple[str, object]:
+    def _jcc(self, insn, ip: int, nxt: int,
+             mnemonic: str | None = None) -> tuple[str, object]:
         target = insn.operands[0].imm
-        c = condition(self.a, self.m, JCC[insn.mnemonic])
+        c = condition(self.a, self.m, JCC[mnemonic or insn.mnemonic])
         cc = self.a.as_const(c)
         if cc is not None:
             return "next", target if cc else nxt
@@ -1237,7 +1317,9 @@ class Lifter:
             # the listing before the `-> <tail: ...>` arrow; without it, `0x145bd7fa4` (whose whole
             # body is `ExAcquireFastMutex`/`ExReleaseFastMutex` traffic ending in
             # `jmp [ExReleaseFastMutex]`) would have returned without releasing the mutex.
-            self._guest_call(insn, ip, nxt, slot)
+            outcome = self._guest_call(insn, ip, nxt, slot)
+            if self.bits == 32 and outcome[0] == 'stop':
+                return outcome
             return "stop", Stop("tail_call", ip, text=f"{mod}!{sym}",
                                 info={"import_slot": slot, "symbol": f"{mod}!{sym}"})
         dest = self.read_op(insn, 0)
@@ -1415,10 +1497,115 @@ class Lifter:
                 and src.type == CS_OP_REG and src.size == 8
                 and self._reg_name(setup, src.reg) == 'rsp')
 
+    def _return_address_thunk(self, ip: int, nxt: int, target: int):
+        """Resolve the two exact PE32 return-address thunks used by this protector.
+
+        Both begin with ``call next+1``. That is not a call to an external
+        procedure: the instruction at ``next`` is the tail byte of the encoded
+        call and the real thunk starts at ``next+1``. The thunk consumes or
+        rewrites the pushed return address, restores ESP, and transfers to code
+        selected at run time. Treating that shape as an unknown Win32 call both
+        loses the continuation and asks for an argument-cleanup contract that
+        does not exist.
+
+        Only the two shapes observed in the PE32 corpus are accepted. Every
+        other nearby call target remains a native ABI boundary.
+        """
+        if not self.return_address_thunks or self.bits != 32 or target != nxt + 1:
+            return None
+
+        from .stackops import adjust, pop, push
+
+        mask = 0xffffffff
+        size1, first, _ = self.decode(target)
+        if size1 and first is not None:
+            # add dword ptr [esp], IMM; ret [IMM]
+            ops = first.operands
+            if (first.mnemonic == 'add' and len(ops) == 2
+                    and ops[0].type == CS_OP_MEM and ops[0].size == 4
+                    and self._reg_name(first, ops[0].mem.base) == 'esp'
+                    and not ops[0].mem.index and not ops[0].mem.segment
+                    and ops[0].mem.disp == 0 and ops[1].type == CS_OP_IMM):
+                second_va = target + size1
+                size2, second, _ = self.decode(second_va)
+                if size2 and second is not None and second.mnemonic == 'ret':
+                    cleanup = int(second.op_str, 0) if second.op_str else 0
+                    if cleanup < 0 or cleanup > 4096 or cleanup % 4:
+                        return None
+                    push(self, self.a.const(nxt, 32), 4, ip)
+                    return_slot = self.m.reg('esp', 32)
+                    old = self.m.load(return_slot, 4, target, self.img.image_u8)
+                    continuation = self.a.bin(
+                        'add', old, self.a.const(ops[1].imm & mask, 32), 32)
+                    self.m.store(return_slot, continuation, 4, target)
+                    self._add_flags(
+                        old, self.a.const(ops[1].imm & mask, 32),
+                        continuation, 32)
+                    pop(self, 4, target)
+                    if cleanup:
+                        adjust(self, cleanup)
+                    continuation = self.a.as_const(continuation)
+                    if continuation is None:
+                        return None
+                    self.events.append({
+                        'kind': 'native_return_thunk',
+                        'site': ip,
+                        'target': target,
+                        'continuation': continuation,
+                        'shape': 'add [esp], imm; ret',
+                        'stack_cleanup': cleanup,
+                        'cleanup_mode': 'callee' if cleanup else 'none',
+                    })
+                    return 'next', continuation & mask
+
+        # pop r32; lea r32, [r32 + IMM]; jmp r32
+        pop_va = target + size1 if size1 else target
+        size2, second, _ = self.decode(pop_va)
+        third_va = pop_va + size2 if size2 else pop_va
+        size3, third, _ = self.decode(third_va)
+        if (not size1 or not size2 or not size3 or third is None
+                or first.mnemonic != 'pop' or len(first.operands) != 1
+                or first.operands[0].type != CS_OP_REG
+                or second.mnemonic != 'lea' or len(second.operands) != 2
+                or third.mnemonic != 'jmp' or len(third.operands) != 1
+                or third.operands[0].type != CS_OP_REG):
+            return None
+        dst, src = second.operands
+        reg = self._reg_name(first, first.operands[0].reg)
+        if (dst.type != CS_OP_REG or src.type != CS_OP_MEM
+                or self._reg_name(second, dst.reg) != reg
+                or self._reg_name(second, src.mem.base) != reg
+                or src.mem.index or src.mem.segment
+                or self._reg_name(third, third.operands[0].reg) != reg):
+            return None
+
+        push(self, self.a.const(nxt, 32), 4, ip)
+        self.m.set_reg(reg, pop(self, 4, target), 32)
+        continuation = self.a.bin(
+            'add', self.m.reg(reg, 32),
+            self.a.const(src.mem.disp & mask, 32), 32)
+        self.m.set_reg(reg, continuation, 32)
+        continuation = self.a.as_const(continuation)
+        if continuation is None:
+            return None
+        self.events.append({
+            'kind': 'native_return_thunk',
+            'site': ip,
+            'target': target,
+            'continuation': continuation,
+            'shape': 'pop r32; lea r32,[r32+imm]; jmp r32',
+            'stack_cleanup': 0,
+            'cleanup_mode': 'none',
+        })
+        return 'next', continuation & mask
+
     def _call(self, insn, ip: int, nxt: int) -> tuple[str, object]:
         op = insn.operands[0]
         if op.type == CS_OP_IMM:
             target = op.imm & ((1 << 64) - 1)
+            transformed = self._return_address_thunk(ip, nxt, target)
+            if transformed is not None:
+                return transformed
             target = self._resolve_call_thunk(target)
         else:
             slot = self._indirect_slot(insn)
@@ -1456,7 +1643,7 @@ class Lifter:
             # point. The experiment and its numbers are kept here so it is not
             # repeated; `probe/scratch_slot.py` is the probe that measures it.
             from .stackops import push
-            push(self, self.a.const(nxt, W64), 8, ip)
+            push(self, self.a.const(nxt, self.bits), self.ptr_bytes, ip)
             return "next", target
 
         return self._guest_call(insn, ip, nxt, target)
@@ -1498,6 +1685,9 @@ class Lifter:
                 # way: the callees here write below their pointer argument.
                 failed_stores = res.stores
 
+        if self.bits == 32:
+            from .win32abi import call as win32_call
+            return win32_call(self, insn, ip, nxt, target)
         self.call_count += 1
         args = [(r, self.m.reg(r, 64)) for r in ("rcx", "rdx", "r8", "r9")]
         # **Read the writable pointers BEFORE the clobber.** `rcx`/`rdx`/`r8`/`r9` are volatile, so
@@ -1569,7 +1759,7 @@ class Lifter:
 
     def _ret(self, insn, ip: int, nxt: int) -> tuple[str, object]:
         from .stackops import adjust, pop
-        dest = pop(self, 8, ip)
+        dest = pop(self, 2 if 0x66 in insn.prefix else self.ptr_bytes, ip)
         if insn.operands:
             adjust(self, insn.operands[0].imm & 0xffff)
         c = self.a.as_const(dest)
@@ -1812,6 +2002,55 @@ def _h_sse_xor(L: Lifter, insn, ip, nxt):
     return "next", nxt
 
 
+def _interleave_low_bytes(L: Lifter, x: int, y: int) -> int:
+    """PUNPCKLBW result for one 64-bit half: x0,y0,x1,y1,...,x7,y7."""
+    a = L.a
+    result: int | None = None
+    for i in range(8):
+        shift = a.const(i * 8, W64)
+        xb = a.trunc(a.bin("shr", x, shift, W64), W8)
+        yb = a.trunc(a.bin("shr", y, shift, W64), W8)
+        for output_index, byte in ((2 * i, xb), (2 * i + 1, yb)):
+            term = a.bin(
+                "shl", a.zext(byte, W64),
+                a.const(output_index * 8, W64), W64,
+            )
+            result = term if result is None else a.bin("or", result, term, W64)
+    assert result is not None
+    return result
+
+
+def _h_punpcklbw(L: Lifter, insn, ip, nxt):
+    """Interleave the low eight bytes of two XMM inputs into a full 128-bit value."""
+    if len(insn.operands) != 2:
+        return L._box(insn, ip, nxt, insn.bytes)
+    dst, src = insn.operands
+    if dst.type != CS_OP_REG:
+        return L._box(insn, ip, nxt, insn.bytes)
+    dst_name = insn.reg_name(dst.reg)
+    if not dst_name.startswith("xmm"):
+        return L._box(insn, ip, nxt, insn.bytes)
+
+    dst_lo, _dst_hi = L.xmm_halves(dst_name)
+    if src.type == CS_OP_REG:
+        src_name = insn.reg_name(src.reg)
+        if not src_name.startswith("xmm"):
+            return L._box(insn, ip, nxt, insn.bytes)
+        src_lo, _src_hi = L.xmm_halves(src_name)
+    elif src.type == CS_OP_MEM and src.size >= 8:
+        src_lo = L.load_at(L.mem_address(insn), 8, ip)
+    else:
+        return L._box(insn, ip, nxt, insn.bytes)
+
+    L.m.xmm[(dst_name, 0)] = _interleave_low_bytes(L, dst_lo, src_lo)
+    L.m.xmm[(dst_name, 1)] = _interleave_low_bytes(
+        L,
+        L.a.bin("shr", dst_lo, L.a.const(32, W64), W64),
+        L.a.bin("shr", src_lo, L.a.const(32, W64), W64),
+    )
+    return "next", nxt
+
+
 def _binop(op_name):
     def go(L: Lifter, insn, ip, nxt):
         w = L.op_width(insn, 0)
@@ -1883,6 +2122,57 @@ def _h_cmp(L: Lifter, insn, ip, nxt):
     return "next", nxt
 
 
+def _h_cmpxchg(L: Lifter, insn, ip, nxt):
+    """CMPXCHG, including the LOCK form after mnemonic normalization.
+
+    The destination is left unchanged and the accumulator receives its old
+    value unless they compare equal. A select implements both outcomes without
+    inventing a CFG edge; the compare flags are still the ordinary SUB flags
+    of accumulator - destination.
+    """
+    w = L.op_width(insn, 0)
+    a = L.a
+    dst = L.read_op(insn, 0)
+    accumulator = L.m.reg("rax", w)
+    replacement = L.read_op(insn, 1)
+    equal = a.bin("eq", accumulator, dst, w)
+    L.write_op(insn, 0, a.select(equal, replacement, dst, w), w)
+    L.m.set_reg("rax", a.select(equal, accumulator, dst, w), w)
+    L._sub_flags(accumulator, dst, a.bin("sub", accumulator, dst, w), w)
+    return "next", nxt
+
+
+def _h_bt(L: Lifter, insn, ip, nxt):
+    """Bit test: CF receives one selected bit; the other arithmetic flags are undefined."""
+    a = L.a
+    base_op = insn.operands[0]
+    width = base_op.size * 8
+    index = L.read_op(insn, 1)
+    index_value = a.as_const(index)
+    if index_value is None:
+        raise _Unsupported("symbolic BT bit index")
+
+    if base_op.type == CS_OP_MEM:
+        # A memory BT addresses a bit string that extends past one operand. The
+        # byte containing bit N is therefore the operand-sized element
+        # containing N modulo the operand width.
+        byte_offset = (index_value // width) * base_op.size
+        address = L.mem_address(insn)
+        if byte_offset:
+            address = a.bin("add", address, a.const(byte_offset, L.bits), L.bits)
+        value = L.load_at(address, base_op.size, ip)
+        bit_index = index_value % width
+    elif base_op.type == CS_OP_REG:
+        value = L.read_op(insn, 0)
+        bit_index = index_value % width
+    else:
+        raise _Unsupported("BT operand is neither register nor memory")
+
+    L.m.set_flags_unknown(("pf", "af", "zf", "sf", "of"))
+    L.m.set_flag("cf", L._bit_of(value, bit_index, width))
+    return "next", nxt
+
+
 def _h_test(L: Lifter, insn, ip, nxt):
     w = L.op_width(insn, 0)
     r = L.a.bin("and", L.read_op(insn, 0), L.read_op(insn, 1), w)
@@ -1891,20 +2181,7 @@ def _h_test(L: Lifter, insn, ip, nxt):
 
 
 def _h_xchg(L: Lifter, insn, ip, nxt):
-    """`xchg` -- and the one place a pair of them can be proved to do nothing.
-
-    The handlers are built from `xchg`/`not` pairs (760 k `not` and 730 k `xchg`
-    against 1.02 M `mov` in 600 sampled handler functions of the DeltaForce build),
-    so a cancelled pair is worth removing at the source: `Machine.set_reg` rebuilds
-    sub-64-bit registers out of `and`/`or`/`shl`, and those rebuilds cannot be folded
-    afterwards, which is how a two-instruction no-op becomes a permanent widening
-    ladder in the value DAG.
-
-    Cancellation is delegated to `mba.SwapTracker`, which only claims it when the
-    same register pair is swapped twice with no write to either in between. When it
-    fires, both registers have already been restored to the refs they held before the
-    first swap, so the right thing to do is nothing at all.
-    """
+    """Exchange operands and cancel the exact `xchg`/`not` obfuscation pair."""
     w = L.op_width(insn, 0)
     pair = _xchg_register_pair(insn)
     tracker = getattr(L.m, "swap_tracker", None)
@@ -1919,8 +2196,6 @@ def _h_xchg(L: Lifter, insn, ip, nxt):
     L.write_op(insn, 0, y, w)
     L.write_op(insn, 1, x, w)
     if pair is not None and tracker is not None and saved is not None:
-        # Recorded *after* the writes: the two writes are this swap's own effect and
-        # must not invalidate the record the way a third-party write would.
         tracker.remember(pair[0], pair[1], w, saved)
     return "next", nxt
 
@@ -2070,20 +2345,63 @@ def _h_push(L: Lifter, insn, ip, nxt):
     from .stackops import push
     w = L.op_width(insn, 0)
     v = L.read_op(insn, 0)
-    n = w // 8 if w in (16, 64) else 8
+    n = w // 8 if w in (16, 32, 64) else L.ptr_bytes
     push(L, v, n, ip)
     return "next", nxt
 
 
+def _h_pusha(L: Lifter, insn, ip, nxt):
+    from .stackops import push
+    width = 16 if 0x66 in insn.prefix else 32
+    saved_sp = L.m.reg(L.sp, width)
+    for reg in ('rax', 'rcx', 'rdx', 'rbx', 'rsp', 'rbp', 'rsi', 'rdi'):
+        value = saved_sp if reg == 'rsp' else L.m.reg(reg, width)
+        push(L, value, width // 8, ip)
+    return 'next', nxt
+
+
+def _h_popa(L: Lifter, insn, ip, nxt):
+    from .stackops import pop
+    width = 16 if 0x66 in insn.prefix else 32
+    for reg in ('rdi', 'rsi', 'rbp', 'rsp', 'rbx', 'rdx', 'rcx', 'rax'):
+        value = pop(L, width // 8, ip)
+        if reg != 'rsp':
+            L.m.set_reg(reg, value, width)
+    return 'next', nxt
+
+
+def _h_loop(L: Lifter, insn, ip, nxt):
+    width = insn.addr_size * 8
+    reg = {16: 'cx', 32: 'ecx', 64: 'rcx'}[width]
+    a = L.a
+    count = L.m.reg(reg, width)
+    if insn.mnemonic in ('jcxz', 'jecxz', 'jrcxz'):
+        pred = a.bin('eq', count, a.const(0, width), width)
+    else:
+        count = a.bin('sub', count, a.const(1, width), width)
+        L.m.set_reg(reg, count, width)
+        pred = a.bin('ne', count, a.const(0, width), width)
+        if insn.mnemonic in ('loope', 'loopne'):
+            zf = L.m.flag('zf')
+            if insn.mnemonic == 'loopne':
+                zf = a.bin('xor', zf, a.const(1, 8), 8)
+            pred = a.bin('and', pred, zf, 8)
+    concrete = a.as_const(pred)
+    target = insn.operands[0].imm
+    if concrete is not None:
+        return 'next', target if concrete else nxt
+    return 'stop', Stop('native_branch', ip, pred=pred, taken=target, not_taken=nxt)
+
+
 def _h_pushfq(L: Lifter, insn, ip, nxt):
     from .stackops import push
-    push(L, L.m.pack_flags(), 8, ip)
+    push(L, L.m.pack_flags(), 2 if 0x66 in insn.prefix else L.ptr_bytes, ip)
     return "next", nxt
 
 
 def _h_popfq(L: Lifter, insn, ip, nxt):
     from .stackops import pop
-    v = pop(L, 8, ip)
+    v = pop(L, 2 if 0x66 in insn.prefix else L.ptr_bytes, ip)
     L.m.unpack_flags(v)
     return "next", nxt
 
@@ -2091,7 +2409,7 @@ def _h_popfq(L: Lifter, insn, ip, nxt):
 def _h_pop(L: Lifter, insn, ip, nxt):
     from .stackops import pop
     w = L.op_width(insn, 0)
-    n = w // 8 if w in (16, 64) else 8
+    n = w // 8 if w in (16, 32, 64) else L.ptr_bytes
     v = pop(L, n, ip)
     L.write_op(insn, 0, v, w)
     return "next", nxt
@@ -2099,8 +2417,8 @@ def _h_pop(L: Lifter, insn, ip, nxt):
 
 def _h_leave(L: Lifter, insn, ip, nxt):
     from .stackops import pop
-    L.m.set_reg("rsp", L.m.reg("rbp", 64), 64)
-    width = 16 if 0x66 in insn.prefix else 64
+    L.m.set_reg(L.sp, L.m.reg(L.bp, L.bits), L.bits)
+    width = 16 if 0x66 in insn.prefix else L.bits
     v = pop(L, width // 8, ip)
     L.m.set_reg("bp" if width == 16 else "rbp", v, width)
     return "next", nxt
@@ -2168,6 +2486,7 @@ _HANDLERS = {
     "xorps": _h_sse_xor,
     "xorpd": _h_sse_xor,
     "pxor": _h_sse_xor,
+    "punpcklbw": _h_punpcklbw,
     "add": _binop("add"),
     "sub": _binop("sub"),
     "and": _binop("and"),
@@ -2178,6 +2497,8 @@ _HANDLERS = {
     "inc": _h_inc,
     "dec": _h_dec,
     "cmp": _h_cmp,
+    "cmpxchg": _h_cmpxchg,
+    "bt": _h_bt,
     "test": _h_test,
     "xchg": _h_xchg,
     "adc": _h_adc,
@@ -2191,9 +2512,17 @@ _HANDLERS = {
     "rol": _rotate("rol"),
     "ror": _rotate("ror"),
     "push": _h_push,
+    "pushal": _h_pusha, "pushaw": _h_pusha,
+    "popal": _h_popa, "popaw": _h_popa,
+    "loop": _h_loop, "loope": _h_loop, "loopne": _h_loop,
+    "jcxz": _h_loop, "jecxz": _h_loop, "jrcxz": _h_loop,
     "pop": _h_pop,
     "pushfq": _h_pushfq,
+    "pushfd": _h_pushfq,
+    "pushf": _h_pushfq,
     "popfq": _h_popfq,
+    "popfd": _h_popfq,
+    "popf": _h_popfq,
     "leave": _h_leave,
     "cdqe": _h_cdqe,
     "cwde": _h_cwde,

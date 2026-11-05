@@ -34,7 +34,8 @@ from dataclasses import dataclass, field
 from .canon import MUTATIONS, identify, influence_set
 from .expr import W64, Arena, boolean_subexpressions, render
 from .guestctx import (ARCH, FLAGS, GUEST_CTX_FROM_ENTRY_RBP, HANDLER_TIME,
-                       GuestCache, GuestContext, from_working_frame)
+                       HOST32, GuestCache, GuestContext, RegisterGuestContext32,
+                       from_working_frame)
 from . import ctxlayout
 from .ir import call_target
 from .lift64 import Lifter, Stop
@@ -60,10 +61,11 @@ WIDE_TIMEOUT_MS = 5000
 # The value is a measurement, not a preference: at 400,000 the root `0x140169e9d` truncated a
 # block and reported 1 unresolved; at 900,000 it reports 17 blocks / 0 unresolved with a clean
 # verifier, and corpus-wide the change is 139 -> 150 blocks and 2 -> 1 unresolved with no root
-# worse (`evidence/E-BUDGET-OR-LOOP.md`). A caller that passes its own smaller budget is
-# choosing to truncate, which is legitimate — but doing it *by accident* is what this constant
-# exists to prevent.
-DEFAULT_STEP_BUDGET = 900_000
+# worse (`evidence/E-BUDGET-OR-LOOP.md`). A fresh current-engine walk also shows
+# that `0x140157674` reaches its real exit after 1,462,211 instructions, so
+# 900,000 still fabricated an unresolved loop at the budget boundary. 1,500,000
+# covers that measured exit with margin.
+DEFAULT_STEP_BUDGET = 1_500_000
 # Site marker for stores the *engine* performs rather than the VM, so a census can
 # tell its own writes from the program's. Also used by the probes.
 SEED_SITE = -1
@@ -288,10 +290,15 @@ class Recoverer:
                  journal: str | None = None, guest_census: bool = False,
                  path_sensitive: bool = True, proof_dispatch: bool = True,
                  entry_context=None):
+        from .arch import Architecture
+        self.arch = Architecture.for_image(img)
+        self.bits = self.arch.bits
+        self.ptr_bytes = self.arch.pointer_bytes
         self.img = img
         self.vm_lo = vm_lo
         self.vm_hi = vm_hi
-        self.stack_base = stack_base
+        self.stack_base = (0x7FFE_FDA0 if self.bits == 32 and stack_base == STACK_BASE
+                           else stack_base & self.arch.mask)
         self.step_budget = step_budget
         self.block_budget = block_budget
         self.max_forks = max_forks
@@ -387,7 +394,7 @@ class Recoverer:
             self.entry_contract = contract
             return arena, machine
         arena = Arena()
-        return arena, Machine(arena, self.stack_base)
+        return arena, Machine(arena, self.stack_base, bits=self.bits)
 
     def _validate_base(self, base: int, pa, pm):
         """Does `base` still look like the guest register file? Cheap: 17 words."""
@@ -507,8 +514,72 @@ class Recoverer:
         # real regression (`tests/test_context_integration.py`).
         return sample, rbp, pa, pm
 
+    def _prepare32(self, root: int) -> tuple[Arena, Machine, Lifter]:
+        """Prepare a PE32 walk without applying the x64 stack-context layout."""
+        pa, pm = self._initial_state(root)
+        probe = self._lifter(pa, pm)
+        sample: dict[int, set[int]] = {}
+        ip = root
+        rbp = None
+        for i in range(20_000):
+            if i % 16 == 0:
+                rbp = pa.as_const(pm.reg("rbp", 64))
+                if rbp is not None:
+                    for off in range(0, CONTEXT_WINDOW, self.ptr_bytes):
+                        value = pm.load(
+                            pa.const(rbp + off, 64), self.ptr_bytes, 0,
+                            self.img.image_u8)
+                        concrete = pa.as_const(value)
+                        if concrete is not None and self.vm_lo <= concrete < self.vm_hi:
+                            sample.setdefault(off, set()).add(concrete)
+            kind, payload = probe.step(ip)
+            if kind != "next":
+                break
+            ip = payload
+
+        if sample:
+            self.vip_slot = max(
+                sample.items(), key=lambda item: (len(item[1]), -item[0]))[0]
+            self.vip_samples = len(sample)
+        if rbp is not None:
+            unwind = pa.as_const(
+                pm.load(pa.const(rbp, 64), self.ptr_bytes, 0, self.img.image_u8))
+            if unwind is not None and self.vm_lo <= unwind < self.vm_hi:
+                self.unwind_slot = unwind
+
+        arena, machine = self._initial_state(root)
+        self.machine = machine
+        self.arena = arena
+        lifter = self._lifter(arena, machine)
+        self.lifter = lifter
+        self._install_load_folder(arena, lifter)
+
+        cached = (self.handler_cache.ctx
+                  if self.handler_cache is not None
+                  and getattr(self.handler_cache.ctx, "register_backed", False)
+                  and self.handler_cache.walk_status.get("confirmed", False)
+                  else None)
+        if cached is not None:
+            self.guest_ctx = cached
+            self.guest_ctx_source = (
+                "native x86 register homes confirmed at handler boundaries "
+                f"({len(self.handler_cache.assignment)} stable register(s))")
+        else:
+            from .arch import NativeRegisters32
+            self.guest_ctx = NativeRegisters32()
+            self.guest_ctx_source = (
+                "native i386 register projection; Guest register homes unproved")
+
+        lifter.guest_ctx = self.guest_ctx
+        if self.guest_census and getattr(
+                self.guest_ctx, "register_backed", False):
+            lifter.enable_register_guest_census(self.guest_ctx)
+        return arena, machine, lifter
+
     def prepare(self, root: int) -> tuple[Arena, Machine, Lifter]:
         """Locate the frame invariants on a throwaway run, then start clean."""
+        if self.bits == 32:
+            return self._prepare32(root)
         # **Ask the handlers where the image is before reading anything.**
         # The old code scanned `rbp + 0..0x90` and called that the context window;
         # that is a different window from the one `guestctx.from_working_frame`
@@ -590,8 +661,14 @@ class Recoverer:
             self.guest_ctx_source = "derived by derive_guest_cache (first-block rbp symbolic)"
         else:
             self.guest_ctx_source = "none (no concrete rbp sampled)"
+        # Keep the projection on the lifter even when the census is disabled.
+        # A PE32 context that is not proved must remain explicit downstream.
+        L.guest_ctx = self.guest_ctx
         if self.guest_ctx is not None and self.guest_census:
-            L.enable_guest_census(self.guest_ctx, self.handler_cache)
+            if getattr(self.guest_ctx, "register_backed", False):
+                L.enable_register_guest_census(self.guest_ctx)
+            elif self.bits == 64:
+                L.enable_guest_census(self.guest_ctx, self.handler_cache)
         return arena, machine, L
 
     # --------------------------------------------------------------- identity
@@ -607,6 +684,32 @@ class Recoverer:
         guest value, which is precisely the explosion this avoids.
         """
         a = L.a
+        if self.bits == 32:
+            # PE32 dispatchers carry VIP and decoder pointers in native
+            # registers, so applying the x64 [RBP+offset] identity would
+            # collapse distinct guest program points.
+            h = 0xCBF29CE484222325
+            pointers = []
+            for index, reg in enumerate(
+                    ('eax', 'ebx', 'ecx', 'edx', 'esi', 'edi', 'ebp')):
+                value = a.as_const(L.m.reg(reg, 32))
+                if value is not None and self.vm_lo <= value < self.vm_hi:
+                    pointers.append((index, value))
+            sp = a.as_const(L.m.reg('esp', 32))
+            if sp is not None:
+                pointers.append((7, sp))
+                for off in range(0, 0x80, 4):
+                    address = (sp + off) & 0xffffffff
+                    if not all(address + i in L.m.mem for i in range(4)):
+                        continue
+                    value = a.as_const(
+                        L.m.load(a.const(address, 32), 4, 0, lambda _: None))
+                    if value is not None and self.vm_lo <= value < self.vm_hi:
+                        pointers.append((8 + off, value))
+            for index, value in pointers:
+                h ^= (index * 0x9E3779B97F4A7C15) ^ value
+                h = (h * 0x100000001B3) & 0xffffffffffffffff
+            return h or 1
         rbp = a.as_const(L.m.reg("rbp", 64))
         if rbp is None:
             return 0
@@ -673,6 +776,8 @@ class Recoverer:
         This is a second bounded walk and it is **not** run by `recover`, so it
         costs nothing to a caller that does not want it.
         """
+        if self.bits == 32:
+            return self._derive_guest_cache32(root, handlers, steps)
         arena, machine = self._initial_state(root)
         L = self._lifter(arena, machine)
         self._install_load_folder(arena, L)
@@ -821,6 +926,81 @@ class Recoverer:
         }
         return cache
 
+    def _derive_guest_cache32(self, root: int, handlers: int,
+                              steps: int) -> GuestCache:
+        """Measure PE32 guest homes in the native x86 register file."""
+        arena, machine = self._initial_state(root)
+        lifter = self._lifter(arena, machine)
+        # This is a measurement walk, not the production recovery path. Keep
+        # exact return-address thunks out of it so pre-existing cache evidence
+        # remains comparable.
+        lifter.return_address_thunks = False
+        self._install_load_folder(arena, lifter)
+        cache = GuestCache(HANDLER_TIME)
+        symbols: dict[int, str] = {}
+        for guest, host in HOST32.items():
+            if guest == "rsp":
+                continue
+            symbol = arena.opaque(f"H_{guest}", 32)
+            symbols[symbol] = guest
+            machine.set_reg(host, symbol, 32)
+
+        ip = root
+        at = boundaries = seen = 0
+        stop = None
+        while at < steps and boundaries < handlers:
+            kind, payload = lifter.step(ip)
+            at += 1
+            if len(lifter.dispatches) > seen:
+                seen = len(lifter.dispatches)
+                boundaries += 1
+                for guest, host in HOST32.items():
+                    if guest == "rsp":
+                        continue
+                    value = machine.reg(host, 32)
+                    if arena.op(value) == "opaque" and value in symbols:
+                        cache.note(guest, symbols[value])
+            if kind != "next":
+                stop = payload
+                break
+            ip = payload
+
+        mapping = {}
+        for guest in HOST32:
+            if guest == "rsp":
+                continue
+            host = cache.host_of(guest)
+            if host is not None:
+                native_host = HOST32.get(host)
+                if native_host is not None:
+                    mapping[guest] = native_host
+        ambiguous = {
+            guest: sorted(
+                host for host, observations in cache._by_host.items()
+                if observations == {guest})
+            for guest in HOST32
+            if sum(observations == {guest}
+                   for observations in cache._by_host.values()) > 1
+        }
+        ctx = RegisterGuestContext32(mapping)
+        cache.ctx = ctx
+        cache.boundaries = boundaries
+        cache.walk_status = {
+            "scope": "native x86 register file; no invented stack spill layout",
+            "steps": at,
+            "boundaries": boundaries,
+            "seeded": True,
+            "candidate": bool(mapping),
+            "confirmed": bool(mapping) and boundaries >= 2,
+            "stable_hosts": dict(cache.assignment),
+            "staging": dict(cache.staging),
+            "ambiguous_guests": ambiguous,
+            "stop": stop.kind if stop else "budget",
+        }
+        self.handler_cache = cache if mapping else None
+        self.handler_cache_walk = dict(cache.walk_status)
+        return cache
+
     def guest_operations(self, limit: int = 0) -> list[tuple[int, str, str]]:
         """The seeded walk's register writes, expressed as guest operations.
 
@@ -922,6 +1102,8 @@ class Recoverer:
         dependent. Everything above it is the VM's private working area, and its
         bytes are exactly what cannot be assumed to be fixed.
         """
+        if self.bits == 32:
+            return None
         rbp = L.a.as_const(L.m.reg("rbp", 64))
         if rbp is None:
             return None

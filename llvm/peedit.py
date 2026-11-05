@@ -55,9 +55,10 @@ DIR_IAT = 12
 #: `peinject.stamp_codeview` repoints at the record inside `.neko`.
 DEBUG_TYPE_CODEVIEW = 2
 
-#: Base relocation types this module writes. `DIR64` is the x64 absolute fixup; `ABSOLUTE` is the
-#: padding type the loader skips, and it is what a block's odd trailing entry uses.
+#: Base relocation types this module writes. `HIGHLOW` is the PE32 absolute fixup, `DIR64` the
+#: PE32+ fixup; `ABSOLUTE` is the padding type the loader skips.
 REL_ABSOLUTE = 0
+REL_HIGHLOW = 3
 REL_DIR64 = 10
 
 
@@ -459,12 +460,18 @@ class Patch:
         """The existing base relocation blocks, verbatim, in the order the loader reads them."""
         return read_relocation_blocks(self.pe)
 
-    def add_relocations(self, sites: list[int], blocks: list[bytes] | None = None) -> bytes:
-        """DIR64 fixups for `sites` (RVAs), appended to the existing blocks as one blob.
+    def add_relocations(self, sites: list[int], blocks: list[bytes] | None = None,
+                        reloc_type: int = REL_DIR64) -> bytes:
+        """Absolute fixups for `sites` (RVAs), appended to the existing blocks as one blob.
 
         Blocks are keyed by 4 KiB page and the loader requires them sorted and non-overlapping, so
         the sites are grouped by page and the pages merged with anything already present.
         """
+        if reloc_type not in (REL_HIGHLOW, REL_DIR64):
+            raise PeError(f'unsupported relocation type {reloc_type}')
+        if self.pe.is64 != (reloc_type == REL_DIR64):
+            raise PeError(f'relocation type {reloc_type} does not match '
+                          f'{"PE32+" if self.pe.is64 else "PE32"}')
         base_blocks = self.relocation_blocks() if blocks is None else list(blocks)
         by_page: dict[int, list[int]] = {}
         for raw in base_blocks:
@@ -487,7 +494,7 @@ class Patch:
             body = bytearray()
             for e in ents:
                 body += struct.pack('<H', (REL_ABSOLUTE << 12) if e == 0 else
-                                    ((REL_DIR64 << 12) | (e & 0xFFF)))
+                                    ((reloc_type << 12) | (e & 0xFFF)))
             out += struct.pack('<II', page, 8 + len(body)) + body
         return bytes(out)
 

@@ -13,15 +13,15 @@ stays an immediate operand, so the code still says which address the recovery na
 
 **2. All mutable state is the caller's.** `tvm_state_t` lives in the caller's stack frame, which is
 what lets `.neko` be R+X (`0x60000020`) with no writable global anywhere in it. The builder *checks*
-that instead of assuming it: a linked image with a writable section, an import, or a base relocation is
-refused, because each would contradict the claim the section characteristics make.
+that instead of assuming it: copied writable sections and imports are refused. AMD64 copied sections
+must also be free of base relocations; PE32 accepts only HIGHLOW fixups, which the injector carries
+into the host relocation table.
 
-**3. No relocations -- measured, not hoped.** References inside the payload are RIP-relative, calls are
-`rel32`, and the original entry point's address is computed from two RVAs the injector patches into
-read-only data (`base = &entry - entry_rva`). So the blob is correct wherever the host is loaded,
-including in a host with no `.reloc` directory at all. `build()` refuses a payload whose linked image
-contains a single DIR64 fixup; `peedit.Patch.add_relocations` can still write fixups, which the tests
-exercise on a payload that does have one, so the machinery is tested rather than merely present.
+**3. Relocations are target-explicit.** On AMD64, references inside the payload are RIP-relative,
+calls are `rel32`, and the original entry point's address comes from pointer-sized RVAs the injector
+patches into read-only data (`base = &entry - entry_rva`). A copied DIR64 fixup is refused. PE32 link
+images can carry HIGHLOW fixups; the injector validates every copied fixup, applies its rebase delta,
+and regenerates the corresponding host relocation entries.
 
 **4. The refusals are carried, not dropped.** A root whose blocks the listing does not settle cannot be
 composed (`whole.WholeRefusal`), so it is left out and named in the manifest with its reason. The
@@ -191,14 +191,12 @@ NAPI = len(API_SYMBOLS)
 
 HEADER_MAGIC = b'NKPH'
 TRAILER_MAGIC = b'NKPT'
-#: **Bumped when the field layout changed.** Version 1 packed the codegen level into the ninth `I`
-#: field, which landed at offset 32 -- on top of the `fuel` quadword. Reading it back returned the fuel
-#: budget (2000) instead of the level, which is exactly the kind of plausible-looking number this
-#: project's tests are supposed to catch, and `test_header_round_trip` now does.
-HEADER_VERSION = 4
+#: Version 5 uses the reserved `I` field for the native pointer width so the
+#: injector can validate the payload and patch pointer-sized RVAs.
+HEADER_VERSION = 5
 #: Q-group and table offsets, chosen so that no field overlaps another.
 HEADER_I_FIELDS = 10          # magic + version, header_bytes, nfunc, slots, slot_bits, n_witness,
-                              # witness_value, opt, mem_mode, reserved
+                              # witness_value, opt, mem_mode, native_bits
 HEADER_Q_BASE = 48            # after 44 bytes of fixed fields, 8-byte aligned
 MEM_MODE_CODE = {'sealed': 0, 'direct': 1}
 MEM_MODE_NAME = {v: k for k, v in MEM_MODE_CODE.items()}
@@ -265,6 +263,11 @@ def emit_module(paths: list[Path], fuel: int = FUEL,
     attrs = '' if stack_probe == 'chkstk' else ' "stack-probe-size"="4294967295"'
     parsed = [(p, G.parse_listing(p.read_text(encoding='utf-8', errors='replace'), p))
               for p in paths]
+    widths = {fn.header.get('native_bits', 64) for _path, fn in parsed}
+    if widths not in ({32}, {64}):
+        raise BuildRefusal(
+            f'one payload cannot mix native widths: {sorted(widths)}')
+    native_bits = next(iter(widths))
     table: list[str] = []
     for _p, fn in parsed:
         for b in fn.blocks:
@@ -319,7 +322,8 @@ def emit_module(paths: list[Path], fuel: int = FUEL,
         '; division via a call. Guest memory goes through the sealed accessors, so no instruction',
         '; here dereferences an address the analysis invented.',
         '',
-        'target triple = "x86_64-pc-windows-msvc"',
+        ('target triple = "i386-pc-windows-msvc"' if native_bits == 32
+         else 'target triple = "x86_64-pc-windows-msvc"'),
         '',
     ]
     for i, name in enumerate(table):
@@ -337,7 +341,7 @@ def emit_module(paths: list[Path], fuel: int = FUEL,
                  '!900 = !{i32 4, !"cf-protection-branch", i32 1}\n'
                  '!901 = !{i32 4, !"cf-protection-return", i32 1}\n')
     return {'text': text, 'table': table, 'manifests': manifests, 'refusals': refusals,
-            'uses': sorted(uses), 'fuel': fuel}
+            'uses': sorted(uses), 'fuel': fuel, 'native_bits': native_bits}
 
 
 #: How each width is described to CodeView. Unsigned, because the listing's widths are bit-vectors and
@@ -635,7 +639,8 @@ def _dispatcher_source(m: dict, index: int) -> list[str]:
     return out
 
 
-def write_gen_source(path: Path, manifests: list[dict], table: list[str]) -> None:
+def write_gen_source(path: Path, manifests: list[dict], table: list[str],
+                     native_bits: int = 64) -> None:
     """`tvm_gen.c`: the witness table, the seeded contexts, and the run the stub performs."""
     seed = _ctx_seed()
     ctx_rows: list[list[int]] = []
@@ -645,6 +650,7 @@ def write_gen_source(path: Path, manifests: list[dict], table: list[str]) -> Non
             v = seed[reg] & 0xFFFFFFFFFFFFFFFF
             row[off:off + 8] = v.to_bytes(8, 'little')
         ctx_rows.append(list(row))
+    address_type = 'u32' if native_bits == 32 else 'u64'
     out = [
         '/* GENERATED by llvm/payload.py -- do not edit. */',
         '#include "tvm_gen.h"',
@@ -654,9 +660,9 @@ def write_gen_source(path: Path, manifests: list[dict], table: list[str]) -> Non
         ' * point, and (in the kernel shape) of the state block. RVAs, not VAs, so no base relocation',
         ' * is needed; `extern` in tvm_entry.c so the compiler has to load them instead of folding the',
         ' * zero they are built with. */',
-        'const u64 tvm_entry_rva = 0;',
-        'const u64 tvm_oep_rva = 0;',
-        'const u64 tvm_state_rva = 0;',
+        f'const {address_type} tvm_entry_rva = 0;',
+        f'const {address_type} tvm_oep_rva = 0;',
+        f'const {address_type} tvm_state_rva = 0;',
         '',
         f'/* {len(table)} witness(es), assignment recorded in the payload header: every value = '
         f'{WITNESS_VALUE}. */',
@@ -748,9 +754,29 @@ def _run(cmd: list[str], what: str, cwd: Path | None = None) -> str:
     return p.stdout
 
 
+def _toolchain_exe(name: str, native_bits: int) -> str:
+    """Return the MSVC compiler-tools binary for the payload architecture."""
+    import shutil
+
+    configured = _tool(name)
+    exe = configured if Path(configured).is_file() else shutil.which(name)
+    if exe is None and name in ('ml.exe', 'ml64.exe'):
+        anchor = shutil.which('cl.exe')
+        if anchor is not None:
+            exe = str(Path(anchor).parent / name)
+    if exe is None:
+        return name
+    current = Path(exe).parent
+    arch = 'x86' if native_bits == 32 else 'x64'
+    tools = current if current.name.casefold() == arch else current.parent / arch
+    candidate = tools / name
+    return str(candidate) if candidate.exists() else name
+
+
 def _cl(work: Path, src: Path, obj: Path, defines: tuple[str, ...] = (),
-        opt: int = 0) -> str:
-    cmd = [_tool('cl.exe'), '/c', '/nologo', f'/O{opt}' if opt else '/Od', '/GS-', '/Zl', '/W4',
+        opt: int = 0, native_bits: int = 64) -> str:
+    cmd = [_toolchain_exe('cl.exe', native_bits), '/c', '/nologo',
+           f'/O{opt}' if opt else '/Od', '/GS-', '/Zl', '/W4',
            '/WX-', f'/I{work}', f'/I{RUNTIME}', f'/Fo{obj}']
     cmd += [f'/D{d}' for d in defines]
     cmd.append(str(src))
@@ -758,7 +784,8 @@ def _cl(work: Path, src: Path, obj: Path, defines: tuple[str, ...] = (),
 
 
 def compile_objects(work: Path, ir_text: str, opt: int = 0,
-                    state: str = 'stack') -> dict[str, Path]:
+                    state: str = 'stack',
+                    native_bits: int = 64) -> dict[str, Path]:
     """Every object the payload needs, and the assembly the linker will see.
 
     `state` decides *where the 82 688-byte state block lives*, and it is a compile-time choice rather
@@ -784,22 +811,45 @@ def compile_objects(work: Path, ir_text: str, opt: int = 0,
         ('runtime', RUNTIME / 'tvm_runtime.c', ('TVM_PAYLOAD',)),
         ('sealed', RUNTIME / 'tvm_sealed.c', ()),
         ('gen', work / 'tvm_gen.c', ()),
-        ('entry', RUNTIME / 'tvm_entry.c', entry_defs),
     ]
+    if native_bits == 64:
+        specs.append(('entry', RUNTIME / 'tvm_entry.c', entry_defs))
     for key, src, defines in specs:
         obj = work / f'tvm_{key}.obj'
-        _cl(work, src, obj, defines, opt)
+        _cl(work, src, obj, defines, opt, native_bits)
         objs[key] = obj
 
-    chk = work / 'tvm_chkstk.obj'
-    _run(['ml64.exe', '/c', '/nologo', f'/Fo{chk}', str(RUNTIME / 'tvm_chkstk.asm')],
-         'ml64.exe tvm_chkstk.asm', cwd=work)
+    if native_bits == 32:
+        entry_c = work / 'tvm_entry32_c.obj'
+        entry_asm = work / 'tvm_entry32.obj'
+        _cl(work, RUNTIME / 'tvm_entry32.c', entry_c, entry_defs, opt, 32)
+        ml = _toolchain_exe('ml.exe', 32)
+        _run([ml, '/c', '/nologo', '/coff', f'/Fo{entry_asm}',
+              str(RUNTIME / 'tvm_entry32.asm')],
+             'ml.exe tvm_entry32.asm', cwd=work)
+        objs['entry'] = entry_asm
+        objs['entry_c'] = entry_c
+        chk = work / 'tvm_chkstk_x86.obj'
+        _run([ml, '/c', '/nologo', '/coff', f'/Fo{chk}',
+              str(RUNTIME / 'tvm_chkstk32.asm')],
+             'ml.exe tvm_chkstk32.asm', cwd=work)
+        helpers = work / 'tvm_i386_helpers.obj'
+        _run([ml, '/c', '/nologo', '/coff', f'/Fo{helpers}',
+              str(RUNTIME / 'tvm_i386_helpers.asm')],
+             'ml.exe tvm_i386_helpers.asm', cwd=work)
+        objs['helpers'] = helpers
+    else:
+        chk = work / 'tvm_chkstk.obj'
+        _run([_toolchain_exe('ml64.exe', 64), '/c', '/nologo', f'/Fo{chk}',
+              str(RUNTIME / 'tvm_chkstk.asm')],
+             'ml64.exe tvm_chkstk.asm', cwd=work)
     objs['chkstk'] = chk
     return objs
 
 
 def link_payload(work: Path, objs: dict[str, Path], opt: int = 0,
-                 pdb: Path | None = None, alt_name: str = 'payload.pdb') -> tuple[Path, Path]:
+                 pdb: Path | None = None, alt_name: str = 'payload.pdb',
+                 native_bits: int = 64) -> tuple[Path, Path]:
     """Link the payload. The image is only ever used as a source of section bytes.
 
     **One link, and that is the fix for the PDB defect.** `--pdb` used to run a *second* link of the
@@ -823,9 +873,16 @@ def link_payload(work: Path, objs: dict[str, Path], opt: int = 0,
     """
     dll = work / 'payload.dll'
     mp = work / 'payload.map'
-    base = [_tool('link.exe'), '/DLL', '/NOENTRY', '/NODEFAULTLIB', '/MACHINE:X64', '/SUBSYSTEM:WINDOWS',
+    machine = '/MACHINE:X86' if native_bits == 32 else '/MACHINE:X64'
+    base = [_toolchain_exe('link.exe', native_bits), '/DLL', '/NOENTRY',
+            '/NODEFAULTLIB', machine, '/SUBSYSTEM:WINDOWS',
             '/FIXED:NO', '/OPT:NOREF', '/OPT:NOICF', '/INCREMENTAL:NO', '/MANIFEST:NO', '/Brepro']
-    objs_all = [str(objs[k]) for k in ('ir', 'runtime', 'sealed', 'gen', 'entry', 'chkstk')]
+    if native_bits == 32:
+        base.append('/SAFESEH:NO')
+    keys = ('ir', 'runtime', 'sealed', 'gen', 'entry', 'chkstk')
+    if native_bits == 32:
+        keys += ('entry_c', 'helpers')
+    objs_all = [str(objs[k]) for k in keys]
     dbg_flags: list[str] = []
     if pdb is not None:
         dbg_flags = ['/DEBUG:FULL', '/DEBUGTYPE:CV', f'/PDB:{pdb}', f'/PDBALTPATH:{alt_name}']
@@ -841,12 +898,15 @@ def parse_map(map_path: Path, image_base: int) -> dict[str, int]:
     """Public symbol -> RVA, from the linker's map file."""
     out: dict[str, int] = {}
     text = map_path.read_text(encoding='utf-8', errors='replace')
-    pat = re.compile(r'^\s+[0-9a-fA-F]{4}:[0-9a-fA-F]{8}\s+(\S+)\s+([0-9a-fA-F]{16})\s')
+    pat = re.compile(
+        r'^\s+[0-9a-fA-F]{4}:[0-9a-fA-F]{8}\s+(\S+)\s+([0-9a-fA-F]{8,16})\s')
     for line in text.splitlines():
         m = pat.match(line)
         if m:
             va = int(m.group(2), 16)
             out.setdefault(m.group(1), va - image_base)
+            if m.group(1).startswith('_'):
+                out.setdefault(m.group(1)[1:], va - image_base)
     return out
 
 
@@ -912,7 +972,8 @@ def image_blob(pe: peedit.Pe, unwind: bool = False) -> tuple[bytes, int]:
     return bytes(out), first
 
 
-def check_payload_image(pe: peedit.Pe, unwind: bool = False) -> dict:
+def check_payload_image(pe: peedit.Pe, unwind: bool = False,
+                        allow_absolute_relocations: bool = False) -> dict:
     """Refuse an image that is not what the payload claims to be.
 
     Three ways the "R+X, no host dependency, position independent" claim can be false, each named with
@@ -929,7 +990,7 @@ def check_payload_image(pe: peedit.Pe, unwind: bool = False) -> dict:
         problems.append(f'import directory {pe.dirs[peedit.DIR_IMPORT]}: the payload must need '
                         'nothing from the host')
     relocs = pe.dirs[peedit.DIR_BASERELOC] if len(pe.dirs) > peedit.DIR_BASERELOC else (0, 0)
-    copied_sites = 0
+    copied_sites: list[tuple[int, int]] = []
     if relocs != (0, 0):
         for blk in peedit.read_relocation_blocks(pe):
             page, size = struct.unpack_from('<II', blk, 0)
@@ -941,20 +1002,37 @@ def check_payload_image(pe: peedit.Pe, unwind: bool = False) -> dict:
                 site = page + (ent & 0xFFF)
                 sec = pe.section_at(site)
                 if sec is not None and not _not_copied(sec.name, unwind):
-                    copied_sites += 1
-        if copied_sites:
-            problems.append(f'{copied_sites} base relocation(s) land inside a copied section: the '
+                    copied_sites.append((site, ent >> 12))
+        expected = (peedit.REL_HIGHLOW if allow_absolute_relocations
+                    else peedit.REL_DIR64)
+        unsupported = [
+            (site, kind) for site, kind in copied_sites if kind != expected]
+        if unsupported:
+            kind = unsupported[0][1]
+            problems.append(
+                f'{len(unsupported)} copied relocation(s) use type {kind}; '
+                f'expected {expected} for a PE{"32" if not pe.is64 else "+"} payload')
+        elif copied_sites and not allow_absolute_relocations:
+            problems.append(f'{len(copied_sites)} base relocation(s) land inside a copied section: the '
                             'payload must be position independent (see peedit.Patch.add_relocations '
                             'for the fixup path)')
     if problems:
         raise BuildRefusal('the linked payload is not position independent:\n  '
                            + '\n  '.join(problems))
-    return {'writable_sections': writable, 'imports': 0, 'relocations': copied_sites}
+    return {
+        'writable_sections': writable,
+        'imports': 0,
+        'relocations': len(copied_sites),
+        'relocation_sites': [site for site, _kind in copied_sites],
+        'relocation_type': (
+            peedit.REL_HIGHLOW if allow_absolute_relocations
+            else peedit.REL_DIR64),
+    }
 
 
 def build_header(manifests: list[dict], table: list[str], symbols: dict[str, int],
                  first_rva: int, span: int, fuel: int, opt: int = 0,
-                 mem_mode: str = 'sealed') -> bytes:
+                 mem_mode: str = 'sealed', native_bits: int = 64) -> bytes:
     """The self-describing trailer: limits, state offsets, API offsets, and the function table."""
     missing = [n for n in API_SYMBOLS if n not in symbols]
     if missing:
@@ -974,7 +1052,7 @@ def build_header(manifests: list[dict], table: list[str], symbols: dict[str, int
     buf = bytearray(header_bytes)
     struct.pack_into('<4sIIIIIIIIII', buf, 0, HEADER_MAGIC, HEADER_VERSION, header_bytes,
                      len(manifests), SLOTS, SLOT_BITS, len(table), WITNESS_VALUE, opt,
-                     MEM_MODE_CODE[mem_mode], 0)
+                     MEM_MODE_CODE[mem_mode], native_bits)
     struct.pack_into('<QQQQ', buf, HEADER_Q_BASE, fuel, STATE_BYTES, off('tvm_payload_entry'), span)
     for i, (_key, value) in enumerate(OFF.items()):
         struct.pack_into('<Q', buf, OFF_BASE + 8 * i, value)
@@ -1000,7 +1078,7 @@ def read_header(section: bytes) -> dict:
     blob = section[header_off:header_off + header_bytes]
     if blob[:4] != HEADER_MAGIC:
         raise BuildRefusal(f'header at {header_off:#x} does not start with NKPH')
-    (magic, version, hb, nfunc, slots, slot_bits, nwit, wval, opt, mem_mode, _reserved) = \
+    (magic, version, hb, nfunc, slots, slot_bits, nwit, wval, opt, mem_mode, native_bits) = \
         struct.unpack_from('<4sIIIIIIIIII', blob, 0)
     fuel, state_bytes, entry_off, span = struct.unpack_from('<QQQQ', blob, HEADER_Q_BASE)
     if version != HEADER_VERSION:
@@ -1025,7 +1103,8 @@ def read_header(section: bytes) -> dict:
     note = blob[p:].decode('ascii', 'replace')
     return {'version': version, 'nfunc': nfunc, 'slots': slots, 'slot_bits': slot_bits,
             'n_witness': nwit, 'witness_value': wval, 'opt': opt,
-            'mem_mode': MEM_MODE_NAME.get(mem_mode, f'#{mem_mode}'), 'fuel': fuel,
+            'mem_mode': MEM_MODE_NAME.get(mem_mode, f'#{mem_mode}'),
+            'native_bits': native_bits, 'fuel': fuel,
             'state_bytes': state_bytes,
             'entry_offset': entry_off, 'image_span': span, 'state_offsets': offs, 'api': api,
             'functions': funcs, 'note': note, 'header_offset': header_off,
@@ -1089,19 +1168,23 @@ def build(paths: list[Path], out_dir: Path, opt: int = 0, fuel: int = FUEL,
     work = (out_dir / 'build') if out_dir else BUILD / 'write-devirt'
     work.mkdir(parents=True, exist_ok=True)
     write_gen_header(work / 'tvm_gen.h', mod['manifests'], mod['table'])
-    write_gen_source(work / 'tvm_gen.c', mod['manifests'], mod['table'])
+    write_gen_source(
+        work / 'tvm_gen.c', mod['manifests'], mod['table'], mod['native_bits'])
 
     t1 = time.time()
-    objs = compile_objects(work, mod['text'], opt=opt, state=state)
-    dll, mp = link_payload(work, objs, opt=opt, pdb=pdb_path)
+    objs = compile_objects(
+        work, mod['text'], opt=opt, state=state, native_bits=mod['native_bits'])
+    dll, mp = link_payload(
+        work, objs, opt=opt, pdb=pdb_path, native_bits=mod['native_bits'])
     t2 = time.time()
 
     pe = peedit.Pe.from_path(dll)
-    checks = check_payload_image(pe, unwind)
+    checks = check_payload_image(
+        pe, unwind, allow_absolute_relocations=mod['native_bits'] == 32)
     symbols = parse_map(mp, pe.image_base)
     blob, first_rva = image_blob(pe, unwind)
     header = build_header(mod['manifests'], mod['table'], symbols, first_rva, len(blob), fuel,
-                          opt=opt, mem_mode=mem_mode)
+                          opt=opt, mem_mode=mem_mode, native_bits=mod['native_bits'])
     # **The unwind records, when the build keeps them.** `.pdata` is a table of
     # `(begin, end, unwind-info)` RVAs; both the functions and the unwind info move with `.neko`, so
     # `peinject` rebases every field by the same delta and merges the result into the host's exception
@@ -1155,6 +1238,7 @@ def build(paths: list[Path], out_dir: Path, opt: int = 0, fuel: int = FUEL,
         'characteristics': SECTION_CHARS, 'section_bytes': len(section),
         'image_span': len(blob), 'entry_offset': parsed['entry_offset'],
         'header_offset': header_off, 'header_bytes': len(header),
+        'native_bits': parsed['native_bits'],
         'functions': parsed['functions'], 'nfunc': parsed['nfunc'],
         'terminals': {f'{m["root"]:#x}': m.get('terminals', []) for m in mod['manifests']
                       if m.get('terminals')},

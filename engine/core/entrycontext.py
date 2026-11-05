@@ -50,7 +50,9 @@ class EntryContextFactory:
         if not vm_lo <= spec.root < vm_hi:
             raise EntryContextError('target-mismatch', spec.root, 'root is outside the VM range')
         a = Arena()
-        m = Machine(a, stack_base)
+        from .arch import Architecture
+        arch = Architecture.for_image(img)
+        m = Machine(a, stack_base, bits=arch.bits)
         L = Lifter(img, m, a, vm_lo, vm_hi)
         ip = spec.caller_entry
         prefix = []
@@ -96,7 +98,7 @@ class EntryContextFactory:
         # Execute the CALL's stack effect rather than the opaque native-call model.
         # The trampoline chain contains only direct JMPs and has no state effect.
         return_address = spec.call_site + size
-        push(L, a.const(return_address, 64), 8, spec.call_site)
+        push(L, a.const(return_address, arch.bits), arch.pointer_bytes, spec.call_site)
         contract = {
             'scope': 'caller-specialized',
             'caller_entry': spec.caller_entry,

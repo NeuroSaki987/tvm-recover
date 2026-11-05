@@ -156,10 +156,20 @@ class Machine:
     # switch exists so the coverage cost can be attributed to the version or to the bytes.
     call_bump_version_default = True
 
-    def __init__(self, arena: Arena, stack_base: int):
+    def __init__(self, arena: Arena, stack_base: int, bits: int = 64):
+        if bits not in (32, 64):
+            raise ValueError('machine width must be 32 or 64')
+        self.bits = bits
+        stack_base &= (1 << bits) - 1
         self.a = arena
         self.stack_base = stack_base
         self.regs: dict[str, int] = {r: arena.init_reg(r) for r in GP64}
+        if bits == 32:
+            self.regs = {
+                r: (arena.const(0, 64) if r[1:].isdigit()
+                    else arena.zext(arena.trunc(v, 32), 64))
+                for r, v in self.regs.items()
+            }
         self.flags: dict[str, int] = {
             f: (arena.const(0, W8) if f == "df" else arena.opaque(f"init_{f}", W8))
             for f in FLAGS

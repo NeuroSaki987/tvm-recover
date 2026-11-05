@@ -37,11 +37,9 @@ from .gueststate import build as build_guest_state
 # Steps per block. **Derived, not copied** — `core.explore.DEFAULT_STEP_BUDGET` is the one
 # definition, and `tests/test_budget_defaults.py` fails if these drift apart. The value is a
 # measurement: at 400,000 the root `0x140169e9d` truncated a block and reported 1 unresolved;
-# at 900,000 it reports 17 blocks / 0 unresolved with a clean verifier, and corpus-wide the
-# change is 139 -> 150 blocks and 2 -> 1 unresolved with no root worse
-# (`evidence/E-BUDGET-OR-LOOP.md`). The one root that still truncates is `0x140157674`, a
-# genuine 226-transfer loop that this engine and the reference both give up on at any budget.
-# The cost is a measured number; see that document, section 6.1.
+# at 900,000 it reports 17 blocks / 0 unresolved with a clean verifier. A fresh
+# current-engine walk shows that `0x140157674` reaches its real exit after
+# 1,462,211 instructions, so the default now covers that path with margin.
 # `TVM_STEPS` / `TVM_BLOCKS` in `main/.env` override these defaults for a local checkout; a command
 # line flag still wins. Nothing is read from the file when no `.env` exists.
 import os as _os
@@ -99,6 +97,9 @@ class Function:
     @property
     def summary(self) -> str:
         t = " TRUNCATED" if self.truncated else ""
+        if (self.recovery.get('state_projection') == 'native_i386'
+                and self.emitted.blocks_with_effect == 0):
+            t += ' NATIVE_STATE_ONLY'
         return (f"{self.root:#x}  {self.blocks:>4} blocks  {self.unresolved:>3} unresolved  "
                 f"{self.instructions:>8} instr  {self.lines:>6} lines  "
                 f"{self.emitted.blocks_with_effect:>4} with effect  "
@@ -148,7 +149,11 @@ def devirtualize(img: PeImage, vm, root: int, handlers: int = 900,
     fn.ctx = R.lifter.guest_ctx
     fn.identity = R.lifter.guest_identity
     fn.cache_status = dict(cache.walk_status)
-    fn.recovery = {'path_sensitive': path_sensitive, 'proof_dispatch': proof_dispatch,
+    native_projection = bool(getattr(fn.ctx, 'native_registers', False))
+    register_backing = bool(getattr(fn.ctx, 'register_backed', False))
+    fn.recovery = {'native_bits': R.bits,
+                   'state_projection': 'native_i386' if native_projection else 'guest_backing',
+                   'path_sensitive': path_sensitive, 'proof_dispatch': proof_dispatch,
                    'conditioned_edges': R.conditioned_edges, 'proofs': dict(R.proof_stats),
                    'loop_cutpoints': R.loop_cutpoints}
     fn.guest_state = build_guest_state(cfg, R.arena)
@@ -161,15 +166,25 @@ def devirtualize(img: PeImage, vm, root: int, handlers: int = 900,
     fn.isolation = R.machine.isolation_report() if hasattr(R, "machine") else {}
     fn.guest_state.assumptions = dict(
         context_base=fn.ctx.base if fn.ctx is not None else None,
-        context_layout='measured x64 working-context layout for this protector build',
+        context_layout=('native i386 registers; Guest backing layout unproved'
+                        if native_projection else
+                        'native x86 register file confirmed at handler boundaries'
+                        if register_backing else
+                        'Guest backing layout unproved' if R.bits == 32
+                        else 'measured x64 working-context layout for this protector build'),
+        native_bits=R.bits,
         frame_isolation=fn.isolation, private_stack_window=R.machine.stack_window,
         native_cfg='first-arrival abstraction; native states at joins are not reanalysed',
         memory='lifted store/havoc history; readonly image and call-summary assumptions apply; '
                'backing parameters and physical context bytes must agree',
         stack_model='fixed synthetic native stack; relocation to arbitrary Guest RSP is not established',
         partial=fn.truncated, unresolved=fn.unresolved,
-        guest_architecture='backing slots are exact observations of the lifted machine; '
-                           'cache ownership and Guest instruction cutpoints remain unproved')
+        guest_architecture=('native i386 registers at CFG cuts, zero-extended into canonical i64 slots; '
+                            'not recovered Guest register homes' if native_projection else
+                            'native x86 guest register file; values are zero-extended into '
+                            'canonical i64 state slots' if register_backing else
+                            'backing slots are exact observations of the lifted machine; '
+                            'cache ownership and Guest instruction cutpoints remain unproved'))
     if fn.entry_contract:
         fn.guest_state.assumptions['entry_context'] = fn.entry_contract
     for i, (label, start, end) in enumerate(em.spans):
@@ -261,6 +276,8 @@ def render(fn: Function, cfg=None, width: int = 150) -> str:
     iso = getattr(fn, "isolation", None) or {}
     head = [
         f"; devirtualized {fn.root:#x}",
+        f"; native bits: {fn.guest_state.assumptions.get('native_bits', 64) if fn.guest_state else 64}",
+        f"; state projection: {fn.recovery.get('state_projection', 'guest_backing')}",
         f"; recovery {fn.recovery}",
         f"; blocks {fn.blocks}   unresolved {fn.unresolved}   "
         f"instructions {fn.instructions}",
@@ -685,11 +702,15 @@ def main() -> int:
         os.makedirs(out_dir, exist_ok=True)
 
     total_lines = total_effect = 0
+    incomplete_pe32 = False
     for root in roots:
         fn = devirtualize(img, vm, root, steps=steps, blocks=blocks,
                          path_sensitive=not legacy, proof_dispatch=proof,
                          entry_context=context)
         print(fn.summary)
+        incomplete_pe32 |= (not img.is64 and (
+            fn.truncated or fn.unresolved > 0
+            or fn.emitted.blocks_with_effect == 0))
         total_lines += fn.lines
         total_effect += fn.emitted.blocks_with_effect
         if out_dir:
@@ -707,7 +728,7 @@ def main() -> int:
     print()
     print(f"TOTAL {total_lines} lines over {len(roots)} functions, "
           f"{total_effect} blocks with a guest effect")
-    return 0
+    return 1 if incomplete_pe32 else 0
 
 
 if __name__ == "__main__":

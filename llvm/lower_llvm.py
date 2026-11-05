@@ -91,8 +91,20 @@ class HazardError(Exception):
     """The emitter would have had to write a construct the posture forbids."""
 
 
+def target_triple(fn: Function) -> str:
+    bits = fn.header.get('native_bits', 64)
+    if bits not in (32, 64):
+        raise HazardError(f'unsupported native width {bits}')
+    return 'i386-pc-windows-msvc' if bits == 32 else 'x86_64-pc-windows-msvc'
+
+
 def _require_parsed(fn: Function) -> None:
     """Do not turn an unsupported side effect into an executable omission."""
+    target_triple(fn)
+    if fn.header.get('state_projection') == 'native_i386':
+        raise HazardError(
+            'PE32 native-state projection has no proved Guest backing layout; '
+            'the state JSON is an analysis artifact, not an executable Guest listing')
     if 'entry_context' in fn.header:
         location = str(fn.path) if fn.path is not None else '<listing>'
         if fn.header.get('entry_context_line'):
@@ -1165,7 +1177,7 @@ def emit_function(fn: Function, blocks=None,
         '; no undef, no poison, `align 1` on every access, shifts masked, division via a call.',
         '; See the module docstring; `hazard_lint` re-checks it on the finished text.',
         '',
-        'target triple = "x86_64-pc-windows-msvc"',
+        f'target triple = "{target_triple(fn)}"',
         '',
         f'@tvm_guest_lo = constant i64 {lo}',
         f'@tvm_guest_hi = constant i64 {hi}',

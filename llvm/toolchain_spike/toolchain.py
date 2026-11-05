@@ -24,21 +24,19 @@ down instead of left to be rediscovered.
 
 ## Why the triple comes from the module
 
-`lower_llvm.py` emits `target triple = "x86_64-pc-windows-msvc"` itself, and the IR
-also carries a `"CodeView"` module flag and `cf-protection-branch`, which only mean
-anything to that target. So the triple is taken from the module when it has one and
-only falls back to the constant when it does not -- emitting this IR for the host
-triple (`x86_64-pc-windows-msvc` here, but not on every machine this repo is read
-on) would silently change codegen rather than fail.
+`lower_llvm.py` emits either `i386-pc-windows-msvc` or
+`x86_64-pc-windows-msvc` itself, and the IR also carries a `"CodeView"` module
+flag and `cf-protection-branch`. So the triple is taken from the module when it
+has one and only falls back to the AMD64 constant when it does not -- emitting
+this IR for the host triple would silently change codegen rather than fail.
 
 ## Relocation model
 
 `reloc='static'` and `codemodel='small'`, matching what the payload link uses
-(`/DLL /NOENTRY /FIXED:NO` into a single `.neko` section). The payload builder
-asserts afterwards that the linked image has **no** base relocations
-(`payload.build` refuses one), so this is the setting that makes that assertion
-hold rather than an arbitrary choice: RIP-relative references and `rel32` calls need
-no fixups at all in this model.
+(`/DLL /NOENTRY /FIXED:NO` into a single `.neko` section). A PE32 link can still
+emit HIGHLOW sites for absolute data; the payload builder validates and records
+those for injection. AMD64 uses RIP-relative references and `rel32` calls, so
+copied DIR64 sites remain a refusal.
 """
 
 from __future__ import annotations
@@ -94,6 +92,11 @@ def _ensure_targets() -> None:
     _targets_ready = True
 
 
+def _default_cpu(triple: str) -> str:
+    """The generic MSVC CPU for the module's pointer width."""
+    return "i686" if triple.startswith("i386-") else "x86-64"
+
+
 def _target_machine(module, opt: int = 0, cpu: str = "", features: str = ""):
     """A target machine for the module's own triple."""
     _ensure_targets()
@@ -105,9 +108,10 @@ def _target_machine(module, opt: int = 0, cpu: str = "", features: str = ""):
     level = _OPT_LEVELS.get(opt) if isinstance(opt, int) else None
     if level is None:
         raise ToolchainError(f"opt level {opt!r} is not one of 0/1/2/3")
+    selected_cpu = cpu or _default_cpu(triple)
     try:
         return target.create_target_machine(
-            cpu=cpu or "x86-64",
+            cpu=selected_cpu,
             features=features,
             opt=level,
             reloc="static",
@@ -115,7 +119,7 @@ def _target_machine(module, opt: int = 0, cpu: str = "", features: str = ""):
         )
     except TypeError:                                         # older llvmlite keyword
         return target.create_target_machine(
-            cpu=cpu or "x86-64",
+            cpu=selected_cpu,
             features=features,
             opt=level,
             reloc="static",
@@ -207,7 +211,11 @@ def target_facts(ir_text: str) -> dict:
     module = parse(ir_text, verify=False)
     triple = (getattr(module, "triple", "") or "").strip() or DEFAULT_TRIPLE
     tm = _target_machine(module, opt=0)
-    return {"triple": triple, "cpu": "x86-64", "data_layout": str(tm.target_data)}
+    return {
+        "triple": triple,
+        "cpu": _default_cpu(triple),
+        "data_layout": str(tm.target_data),
+    }
 
 
 def main(argv: list[str]) -> int:
