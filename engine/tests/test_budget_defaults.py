@@ -50,6 +50,12 @@ class BudgetDefaults(unittest.TestCase):
         self.assertNotEqual(DEFAULT_STEP_BUDGET, 200_000)
         self.assertGreaterEqual(DEFAULT_STEP_BUDGET, 900_000)
 
+    def test_default_budget_reaches_the_known_loop_exit(self) -> None:
+        # Fresh recovery of 0x140157674 reaches its real exit after 1,462,211
+        # instructions. The default must cover that observed path rather than
+        # replacing the exit with a loop-summary edge.
+        self.assertGreaterEqual(DEFAULT_STEP_BUDGET, 1_462_211)
+
     def test_truncation_detail_names_the_budget(self) -> None:
         from types import SimpleNamespace
         # A budget of zero makes the lifting loop exhaust before the first instruction, which

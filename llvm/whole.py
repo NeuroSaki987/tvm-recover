@@ -38,7 +38,7 @@ from execution_status import TERMINAL_BIT, TERMINAL_KINDS, ENCODING, terminal_de
 
 from guestir import CTX_LAYOUT, Block, Function
 from lower_llvm import (Emitter, HazardError, _abs_addresses, _san, _TY, _type_hint,
-                        _undef_names, _require_parsed)
+                        _undef_names, _require_parsed, target_triple)
 
 
 class WholeRefusal(HazardError):
@@ -581,7 +581,7 @@ def emit_whole(fn: Function, attrs: str = ' "stack-probe-size"="4294967295"',
         '; dereferenceable/noundef, no undef, no poison, `align 1` on every access, shifts masked,',
         '; division via a call. `hazard_lint` re-checks it on the finished text.',
         '',
-        'target triple = "x86_64-pc-windows-msvc"',
+        f'target triple = "{target_triple(fn)}"',
         '',
         f'@tvm_guest_lo = constant i64 {lo}',
         f'@tvm_guest_hi = constant i64 {hi}',

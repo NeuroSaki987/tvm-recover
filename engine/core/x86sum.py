@@ -95,8 +95,8 @@ def summarize(L, entry: int, ret_addr: int, limit: int) -> Summary:
     written: list[tuple] = []
     m.store = _recording_store
 
-    m.set_reg("rsp", a.const(rsp - 8, W64), 64)
-    m.store(a.const(rsp - 8, W64), a.const(ret_addr, W64), 8, entry)
+    from .stackops import push
+    push(L, a.const(ret_addr, L.bits), L.ptr_bytes, entry)
     written.clear()  # the return-address push is the harness's, not the callee's
 
     ip = entry

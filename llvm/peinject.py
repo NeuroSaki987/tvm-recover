@@ -9,23 +9,21 @@ self-describing header `payload.py` built. Nothing in the host's existing sectio
 analyst can diff the two files and see exactly one new section plus the two header fields below.
 
 **2. Redirect `AddressOfEntryPoint`** to `neko_rva + entry_offset`. The payload's first instruction is
-the entry stub, so the loader now runs the devirtualized code before the original code -- and the
-stub's last instruction is a tail `jmp` to the original entry point, with the loader's own stack
-pointer and arguments intact (measured in `llvm/miniload.py`, not asserted here).
+the entry stub, so the loader runs the devirtualized code before the original code and then resumes
+the original entry point. AMD64 calls it through the native ABI; i386 restores the saved register
+file and uses a push/ret tail transfer so no loader-supplied register is consumed.
 
-**3. Patch two 8-byte RVAs inside `.neko`** (`tvm_entry_rva`, `tvm_oep_rva` in the payload's read-only
-data). They are what the stub uses to compute the image base without a relocation:
+**3. Patch pointer-sized RVAs inside `.neko`** (`tvm_entry_rva`, `tvm_oep_rva` and, in the section
+shape, `tvm_state_rva`). They are what the stub uses to compute the image base without another
+relocation:
 `base = &tvm_payload_entry - tvm_entry_rva`, then `target = base + tvm_oep_rva`.
 
-**4. Relocations.** This payload needs *none*, and that is a measured property, not an assumption:
-`payload.build()` refuses an image with a base relocation directory, and this module refuses to inject
-a payload whose manifest reports one unless the caller supplies the fixup sites. The writer exists
-(`peedit.Patch.add_relocations`, exercised by `llvm/tests/test_write_devirt.py` against a synthetic
-payload that has a DIR64 fixup) because the alternative -- assuming nothing will ever need one -- is
-how a tool acquires a class of image it silently breaks. When it is used, the fixups are merged with
-the host's existing relocation blocks into one new read-only section and the directory entry is
-repointed at it, because the directory must describe one contiguous range and the host's blocks are
-nowhere near the new section.
+**4. Relocations.** AMD64 copied sections are expected to contain no DIR64 site. PE32 payload sections
+carry HIGHLOW sites produced by the linker; this module checks the site/type metadata, applies the
+preferred-address delta to the copied image, and adds the same sites to the host relocation table.
+Additional caller-supplied sites are supported. Fixups are merged with the host's existing relocation
+blocks into one new read-only section and the directory entry is repointed, because the directory must
+describe one contiguous range and the host's blocks are nowhere near the new section.
 
 Two host properties are handled explicitly rather than silently:
 
@@ -75,6 +73,7 @@ import pdbedit  # noqa: E402
 import peedit  # noqa: E402
 
 MACHINE_AMD64 = 0x8664
+MACHINE_I386 = 0x14C
 DEBUG_TYPE_CODEVIEW = peedit.DEBUG_TYPE_CODEVIEW
 #: IMAGE_DEBUG_TYPE_EX_DLLCHARACTERISTICS and its CET bit.
 DEBUG_TYPE_EX_DLLCHARACTERISTICS = 20
@@ -95,7 +94,7 @@ def inject(host: bytes | Path, payload_bin: bytes, meta: dict, *,
     """Return `(patched_file_bytes, report)`.
 
     `reloc_sites` are RVAs **inside `.neko`** that hold an absolute address and therefore need a
-    DIR64 fixup; the RVA of the section is added to each. An empty list (the default, and what this
+    native-width fixup; the RVA of the section is added to each. An empty list (the default, and what this
     payload reports) means the host's relocation table is not touched at all.
 
     `pdb` is the PDB `payload.build()` produced and `pdb_out` where the rebased copy goes (default: a
@@ -106,12 +105,15 @@ def inject(host: bytes | Path, payload_bin: bytes, meta: dict, *,
     """
     pe = host if isinstance(host, peedit.Pe) else peedit.Pe(bytes(host) if isinstance(host, bytes)
                                                            else Path(host).read_bytes(), label)
-    if pe.machine != MACHINE_AMD64:
-        raise InjectRefusal(f'{pe.label}: machine {pe.machine:#x} is not AMD64; the payload is '
-                            'x86-64 code and the recovery only produced AMD64 listings')
-
-    section = payload_bin
-    header = payload_mod.read_header(section)
+    header = payload_mod.read_header(payload_bin)
+    native_bits = int(header.get('native_bits', 64))
+    pointer_code = '<I' if native_bits == 32 else '<Q'
+    expected_machine = MACHINE_I386 if native_bits == 32 else MACHINE_AMD64
+    machine_name = 'I386' if native_bits == 32 else 'AMD64'
+    if pe.machine != expected_machine:
+        raise InjectRefusal(
+            f'{pe.label}: host machine {pe.machine:#x} does not match the payload native width '
+            f'{native_bits} (expected {machine_name} machine {expected_machine:#x})')
     if pe.sections_named(payload_mod.SECTION_NAME):
         raise InjectRefusal(f'{pe.label}: a section named {payload_mod.SECTION_NAME!r} already '
                             'exists; refusing to create a second one that a name search would have '
@@ -125,7 +127,20 @@ def inject(host: bytes | Path, payload_bin: bytes, meta: dict, *,
     host_checksum_valid = peedit.pe_checksum(bytes(pe.data), pe.checksum_off) == original_checksum
 
     links = meta.get('links', {})
-    if links.get('relocations'):
+    payload_reloc_offsets: list[int] = []
+    if native_bits == 32:
+        first_rva = int(meta['image_first_rva'])
+        payload_reloc_offsets = [
+            int(site) - first_rva
+            for site in links.get('relocation_sites', [])]
+        if links.get('relocations', 0) != len(payload_reloc_offsets):
+            raise InjectRefusal(
+                f"{pe.label}: payload reports {links.get('relocations', 0)} copied relocation(s) "
+                f"but supplied {len(payload_reloc_offsets)} site(s)")
+        if any(not (0 <= off <= len(payload_bin) - 4)
+               for off in payload_reloc_offsets):
+            raise InjectRefusal('a PE32 payload relocation site is outside .neko')
+    elif links.get('relocations'):
         raise InjectRefusal(f"{pe.label}: the payload image reports {links['relocations']} base "
                             'relocation(s); pass their sites explicitly (reloc_sites) so the host '
                             'relocation table can be rebuilt')
@@ -144,7 +159,12 @@ def inject(host: bytes | Path, payload_bin: bytes, meta: dict, *,
     # (`1 + state`), nothing was grown, and the injection then failed on the *third* section with
     # "only 80 byte(s) of header space ... 120 needed". `ACE-CORE.sys3` had 24 bytes and grew for
     # two, so a corpus that started with that image never saw it.
-    neko_rva_room = (1 + (1 if reloc_sites else 0) + (1 if meta.get('unwind') else 0)
+    all_reloc_offsets = list(payload_reloc_offsets)
+    for site in reloc_sites or []:
+        if site not in all_reloc_offsets:
+            all_reloc_offsets.append(site)
+    neko_rva_room = (1 + (1 if all_reloc_offsets else 0)
+                     + (1 if meta.get('unwind') else 0)
                      + (1 if meta.get('state_section') else 0))
     growth = 0
     if patch.header_room() < 40 * neko_rva_room:
@@ -154,7 +174,19 @@ def inject(host: bytes | Path, payload_bin: bytes, meta: dict, *,
         # look like one that did not.
         growth = patch.grow_headers(sections=neko_rva_room)
 
-    neko_rva = patch.append_section(payload_mod.SECTION_NAME, section, payload_mod.SECTION_CHARS)
+    section = bytearray(payload_bin)
+    neko_rva = patch.append_section(
+        payload_mod.SECTION_NAME, bytes(section), payload_mod.SECTION_CHARS)
+    if native_bits == 32 and payload_reloc_offsets:
+        preferred = int(meta['dll']['image_base'])
+        # The copied blob starts at `first_rva`, so an absolute pointer to
+        # `preferred + N` becomes `host_base + neko_rva + N - first_rva`.
+        delta = pe.image_base + neko_rva - first_rva - preferred
+        for off in payload_reloc_offsets:
+            value = struct.unpack_from('<I', section, off)[0]
+            struct.pack_into(
+                '<I', section, off, (value + delta) & 0xFFFFFFFF)
+        patch.added[-1].data[:] = section
     unwind = None
     if meta.get('unwind'):
         # **The life-or-death step for a kernel image.** `.pdata` travels inside `.neko` (see
@@ -175,7 +207,9 @@ def inject(host: bytes | Path, payload_bin: bytes, meta: dict, *,
             raise InjectRefusal(f'the payload reports a {size}-byte state section; expected a positive '
                                'multiple of 16')
         state_rva = patch.append_section(STATE_SECTION_NAME, bytes(size), STATE_SECTION_CHARS)
-        patch.set_bytes(neko_rva + header['api']['tvm_state_rva'], struct.pack('<Q', state_rva))
+        patch.set_bytes(
+            neko_rva + header['api']['tvm_state_rva'],
+            struct.pack(pointer_code, state_rva))
         state_section = {'name': STATE_SECTION_NAME, 'rva': state_rva, 'bytes': size,
                          'chars': STATE_SECTION_CHARS}
         patch.notes.append(f'state block: {size} byte(s) in {STATE_SECTION_NAME} at rva '
@@ -185,14 +219,19 @@ def inject(host: bytes | Path, payload_bin: bytes, meta: dict, *,
     patch.set_entry(entry_rva)
 
     api = header['api']
-    patch.set_bytes(neko_rva + api['tvm_entry_rva'], struct.pack('<Q', entry_rva))
-    patch.set_bytes(neko_rva + api['tvm_oep_rva'], struct.pack('<Q', original_ep))
+    patch.set_bytes(
+        neko_rva + api['tvm_entry_rva'], struct.pack(pointer_code, entry_rva))
+    patch.set_bytes(
+        neko_rva + api['tvm_oep_rva'], struct.pack(pointer_code, original_ep))
 
     reloc_section = None
     n_relocs = 0
-    if reloc_sites:
-        sites = [neko_rva + s for s in reloc_sites]
-        blocks = patch.add_relocations(sites)
+    if all_reloc_offsets:
+        sites = [neko_rva + s for s in all_reloc_offsets]
+        blocks = patch.add_relocations(
+            sites,
+            reloc_type=(peedit.REL_HIGHLOW if native_bits == 32
+                        else peedit.REL_DIR64))
         reloc_section = patch.append_section('.neko.r', blocks, 0x42000040)
         patch.set_dir(peedit.DIR_BASERELOC, reloc_section, len(blocks))
         n_relocs = len(sites)
@@ -212,12 +251,16 @@ def inject(host: bytes | Path, payload_bin: bytes, meta: dict, *,
     check = verify(pe, out, neko_rva, entry_rva, debug)
     report = {
         'host': pe.label, 'host_bytes': host_bytes, 'out_bytes': len(out),
+        'native_bits': native_bits,
         'host_entry_rva': original_ep, 'neko_rva': neko_rva, 'neko_chars': payload_mod.SECTION_CHARS,
         'neko_name': list(payload_mod.SECTION_NAME_PADDED), 'entry_rva': entry_rva,
         'entry_offset': header['entry_offset'],
         'payload_bytes': len(section), 'image_span': header['image_span'],
         'nfunc': header['nfunc'], 'state_bytes': header['state_bytes'], 'fuel': header['fuel'],
-        'n_relocs': n_relocs, 'reloc_section_rva': reloc_section, 'unwind': unwind,
+        'n_relocs': n_relocs,
+        'reloc_type': 'HIGHLOW' if native_bits == 32 else 'DIR64',
+        'payload_relocations': len(payload_reloc_offsets),
+        'reloc_section_rva': reloc_section, 'unwind': unwind,
         'state_section': state_section,
         'certificate': cert_note, 'checksum': {'stored_new': struct.unpack_from(
             '<I', out, pe.checksum_off)[0], 'stored_old': original_checksum},

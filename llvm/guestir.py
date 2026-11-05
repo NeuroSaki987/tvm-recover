@@ -460,6 +460,16 @@ def parse_listing(text: str, path: Path | None = None) -> Function:
     body_started = False
 
     for line_number, raw in enumerate(lines, 1):
+        projection = re.fullmatch(r';\s*state projection:\s*(\w+)\s*', raw.strip())
+        if projection:
+            header['state_projection'] = projection[1]
+            continue
+        architecture = re.fullmatch(r';\s*native bits:\s*(\d+)\s*', raw.strip())
+        if architecture:
+            if 'native_bits' in header:
+                raise ParseError('duplicate native bits header')
+            header['native_bits'] = int(architecture[1])
+            continue
         if not raw.strip():
             continue
         context = re.match(r'^;\s*entry context:\s*(.*)$', raw.strip())

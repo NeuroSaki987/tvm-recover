@@ -39,8 +39,20 @@ from __future__ import annotations
 # found it would have found any other order equally well, and it found this one.
 ARCH = ("rax", "rbx", "rcx", "rdx", "rsp", "rbp", "rsi", "rdi",
         "r8", "r9", "r10", "r11", "r12", "r13", "r14", "r15")
+ARCH32 = ARCH[:8]
+HOST32 = {
+    "rax": "eax",
+    "rbx": "ebx",
+    "rcx": "ecx",
+    "rdx": "edx",
+    "rsp": "esp",
+    "rbp": "ebp",
+    "rsi": "esi",
+    "rdi": "edi",
+}
 FLAGS = "rflags"
 FLAGS_OFF = 0x80
+FLAGS_OFF32 = 0x20
 
 # The image is at `entry_rbp + 0x90`, and the frame the recovery loop samples is
 # `entry_rbp + 0xa8`, so the offset from the working frame is the sum. The working
@@ -56,21 +68,33 @@ W64 = 64
 class GuestContext:
     """Maps an address to the guest register it holds, and back."""
 
-    __slots__ = ("base", "_by_addr", "_by_reg")
+    __slots__ = ("base", "bits", "slot_bytes", "regs", "_by_addr", "_by_reg")
 
-    def __init__(self, base: int):
+    def __init__(self, base: int, *, bits: int = 64):
+        if bits not in (32, 64):
+            raise ValueError(f"unsupported Guest context width {bits}")
         self.base = base
+        self.bits = bits
+        self.slot_bytes = bits // 8
+        self.regs = ARCH if bits == 64 else ARCH32
         self._by_addr: dict[int, str] = {}
         self._by_reg: dict[str, int] = {}
-        for i, reg in enumerate(ARCH):
-            self._by_addr[base + 8 * i] = reg
-            self._by_reg[reg] = base + 8 * i
-        self._by_addr[base + FLAGS_OFF] = FLAGS
-        self._by_reg[FLAGS] = base + FLAGS_OFF
+        flags_off = FLAGS_OFF if bits == 64 else FLAGS_OFF32
+        for i, reg in enumerate(self.regs):
+            address = base + self.slot_bytes * i
+            self._by_addr[address] = reg
+            self._by_reg[reg] = address
+        self._by_addr[base + flags_off] = FLAGS
+        self._by_reg[FLAGS] = base + flags_off
 
     @property
     def span(self) -> tuple[int, int]:
-        return self.base, self.base + FLAGS_OFF + 8
+        flags_off = FLAGS_OFF if self.bits == 64 else FLAGS_OFF32
+        return self.base, self.base + flags_off + self.slot_bytes
+
+    memory_backed = True
+    register_backed = False
+    native_registers = False
 
     def reg_at(self, addr: int) -> str | None:
         """The guest register an address names, or None if it is not a slot."""
@@ -84,13 +108,51 @@ class GuestContext:
         return None if a is None else a - self.base
 
     def __repr__(self) -> str:  # pragma: no cover - diagnostic only
-        return f"<GuestContext base={self.base:#x} slots={len(self._by_addr)}>"
+        return (f"<GuestContext base={self.base:#x} bits={self.bits} "
+                f"slots={len(self._by_addr)}>")
+
+
+class RegisterGuestContext32:
+    """Observed PE32 state held directly in the native x86 register file."""
+
+    __slots__ = ("guest_to_host",)
+
+    bits = 32
+    slot_bytes = 4
+    regs = ARCH32
+    memory_backed = False
+    register_backed = True
+    native_registers = False
+    base = None
+    span = (0, 0)
+
+    def __init__(self, guest_to_host: dict[str, str] | None = None):
+        self.guest_to_host = dict(HOST32 if guest_to_host is None else guest_to_host)
+
+    def host_of(self, guest: str) -> str | None:
+        return self.guest_to_host.get(guest)
+
+    def guest_of_host(self, host: str) -> str | None:
+        for guest, candidate in self.guest_to_host.items():
+            if candidate == host:
+                return guest
+        return None
+
+    def addr_of(self, _reg: str):
+        return None
+
+    def reg_at(self, _address: int):
+        return None
+
+    def __repr__(self) -> str:  # pragma: no cover - diagnostic only
+        return f"<RegisterGuestContext32 mapping={self.guest_to_host}>"
 
 
 def from_working_frame(working_rbp: int,
-                       delta: int = GUEST_CTX_FROM_WORKING_RBP) -> GuestContext:
+                       delta: int = GUEST_CTX_FROM_WORKING_RBP,
+                       *, bits: int = 64) -> GuestContext:
     """The context for a root whose working frame base has been sampled."""
-    return GuestContext(working_rbp + delta)
+    return GuestContext(working_rbp + delta, bits=bits)
 
 
 # How a `GuestCache` was filled. The two answer different questions and disagree,
@@ -203,10 +265,9 @@ class GuestCache:
         return next(iter(seen))
 
     def host_of(self, guest: str) -> str | None:
-        for host, seen in self._by_host.items():
-            if seen == {guest}:
-                return host
-        return None
+        hosts = [host for host, seen in self._by_host.items()
+                 if seen == {guest}]
+        return hosts[0] if len(hosts) == 1 else None
 
     @property
     def assignment(self) -> dict[str, str]:
