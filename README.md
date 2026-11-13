@@ -226,3 +226,13 @@ listing 是 VM 做过什么的记录，不是反编译结果。未解析的 disp
 ##  Thanks
 
 基于 [capstone](https://www.capstone-engine.org/) 反汇编，基于 [llvmlite](https://llvmlite.readthedocs.io/) 做 LLVM 后端。
+
+## Star History
+
+<a href="https://www.star-history.com/?repos=neurosaki987%2Ftvm-recover&type=date&legend=top-left">
+ <picture>
+   <source media="(prefers-color-scheme: dark)" srcset="https://api.star-history.com/chart?repos=neurosaki987/tvm-recover&type=date&theme=dark&legend=top-left" />
+   <source media="(prefers-color-scheme: light)" srcset="https://api.star-history.com/chart?repos=neurosaki987/tvm-recover&type=date&legend=top-left" />
+   <img alt="Star History Chart" src="https://api.star-history.com/chart?repos=neurosaki987/tvm-recover&type=date&legend=top-left" />
+ </picture>
+</a>
