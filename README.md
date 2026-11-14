@@ -2,9 +2,9 @@
 
 # tvm-recover
 
-[![DOI](https://zenodo.org/badge/DOI/10.5281/zenodo.23474767.svg)](https://doi.org/10.5281/zenodo.23474767)
+[![DOI](https://zenodo.org/badge/DOI/10.5281/zenodo.23474767.svg)](https://doi.org/10.5281/zenodo.24210417)
 
-关联 Zenodo 记录：[10.5281/zenodo.23474767](https://doi.org/10.5281/zenodo.23474767)。
+关联 Zenodo 记录：[10.5281/zenodo.23474767](https://doi.org/10.5281/zenodo.24210417)。
 
 >⚠️ **免责声明：** 本项目仅用于获得授权的安全研究、互操作性分析和教育，不包含或提供商业反作弊系统的绕过功能。使用者须确保拥有分析目标二进制文件的合法权利。
 
